@@ -106,6 +106,16 @@ def extract_linguistic_context(
     prob_diff_flat = prob_diff_masked.view(-1)
     topk_values, topk_indices = torch.topk(prob_diff_flat, min(top_k, prob_diff_flat.numel()))
 
+    # Extract correctness information for each sample in the batch
+    correctness_scores = None
+    if "acc" in data.non_tensor_batch:
+        # Use accuracy field from reward function (preferred method)
+        correctness_scores = data.non_tensor_batch["acc"]
+    elif "token_level_scores" in data.batch:
+        # Fallback: infer correctness from total reward score
+        total_scores = data.batch["token_level_scores"].sum(dim=-1)
+        correctness_scores = (total_scores > 0).cpu().numpy()
+
     divergence_logs = []
 
     for rank, (div_value, flat_idx) in enumerate(zip(topk_values, topk_indices)):
@@ -144,6 +154,45 @@ def extract_linguistic_context(
             "logprob_diff": abs(rollout_logprob - actor_logprob),
             "flip_type": flip_type,
         }
+
+        # Add correctness information if available
+        if correctness_scores is not None:
+            log_entry["is_correct"] = bool(correctness_scores[batch_idx])
+
+            # Also add total score for additional context
+            if "token_level_scores" in data.batch:
+                log_entry["total_score"] = data.batch["token_level_scores"][batch_idx].sum().item()
+
+        # Extract position_ids and attention_mask for this token
+        if "position_ids" in data.batch:
+            position_ids_full = data.batch["position_ids"][batch_idx]
+            # Calculate position in full sequence
+            full_seq_pos = len(position_ids_full) - seq_len + seq_idx
+            if 0 <= full_seq_pos < len(position_ids_full):
+                if position_ids_full.dim() == 1:
+                    position_id_value = position_ids_full[full_seq_pos].item()
+                    log_entry["position_id"] = position_id_value
+                elif position_ids_full.dim() == 2:
+                    # Handle multi-dimensional position_ids (e.g., for qwen2vl mrope)
+                    position_id_values = position_ids_full[:, full_seq_pos].tolist()
+                    log_entry["position_ids"] = position_id_values
+
+        if "attention_mask" in data.batch:
+            attention_mask_full = data.batch["attention_mask"][batch_idx]
+            # Calculate position in full sequence
+            full_seq_pos = len(attention_mask_full) - seq_len + seq_idx
+            if 0 <= full_seq_pos < len(attention_mask_full):
+                attention_mask_value = attention_mask_full[full_seq_pos].item()
+                log_entry["attention_mask_value"] = attention_mask_value
+
+                # Count how many padding tokens are in the prompt
+                # (useful for understanding the context mismatch)
+                prompt_length = len(attention_mask_full) - seq_len
+                if prompt_length > 0:
+                    num_padding_tokens = (attention_mask_full[:prompt_length] == 0).sum().item()
+                    log_entry["num_prompt_padding_tokens"] = num_padding_tokens
+                    log_entry["prompt_length_with_padding"] = prompt_length
+                    log_entry["prompt_length_without_padding"] = prompt_length - num_padding_tokens
 
         # Decode token and context if tokenizer available
         if tokenizer is not None:
@@ -290,6 +339,14 @@ def log_divergence_human_readable(divergence_logs: list[dict]):
             f"(from end: {log_entry['position_from_end']})"
         )
         logger.info(f"  Batch Index: {log_entry['batch_idx']}")
+
+        # Log correctness information if available
+        if 'is_correct' in log_entry:
+            correctness_str = "✓ CORRECT" if log_entry['is_correct'] else "✗ INCORRECT"
+            logger.info(f"  Answer Correctness: {correctness_str}")
+            if 'total_score' in log_entry:
+                logger.info(f"  Total Score: {log_entry['total_score']:.4f}")
+
         logger.info(f"  Rollout: prob={log_entry['rollout_prob']:.6f}, logprob={log_entry['rollout_logprob']:.4f}")
         logger.info(f"  Actor:   prob={log_entry['actor_prob']:.6f}, logprob={log_entry['actor_logprob']:.4f}")
         logger.info(f"  LogProb Diff: {log_entry['logprob_diff']:.4f}")
@@ -307,6 +364,20 @@ def log_divergence_human_readable(divergence_logs: list[dict]):
 
         if 'WARNING' in log_entry:
             logger.warning(f"  WARNING: {log_entry['WARNING']}")
+
+        # Log position and attention information
+        if 'position_id' in log_entry:
+            logger.info(f"  Position ID: {log_entry['position_id']}")
+        if 'position_ids' in log_entry:
+            logger.info(f"  Position IDs (mrope): {log_entry['position_ids']}")
+        if 'attention_mask_value' in log_entry:
+            logger.info(f"  Attention Mask: {log_entry['attention_mask_value']}")
+        if 'num_prompt_padding_tokens' in log_entry:
+            logger.info(
+                f"  Prompt Padding: {log_entry['num_prompt_padding_tokens']} padding tokens "
+                f"(prompt length: {log_entry['prompt_length_without_padding']} → "
+                f"{log_entry['prompt_length_with_padding']} with padding)"
+            )
 
         if "context_text" in log_entry:
             logger.info(f"  Context [{log_entry['context_start_pos']}:{log_entry['context_end_pos']}]: "

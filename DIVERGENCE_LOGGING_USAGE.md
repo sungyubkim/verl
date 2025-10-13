@@ -131,6 +131,8 @@ Each line is a JSON object for easy parsing:
   "rollout_logprob": -0.0795,
   "actor_logprob": -8.9034,
   "logprob_diff": 8.8239,
+  "is_correct": true,
+  "total_score": 1.0,
   "context_text": "'hello world of coding'",
   "context_start_pos": 7,
   "context_end_pos": 18,
@@ -140,6 +142,10 @@ Each line is a JSON object for easy parsing:
   "response_num_tokens": 50
 }
 ```
+
+**New Fields (added in correctness logging update):**
+- `is_correct` (bool): Whether the response generated a correct answer (based on reward function)
+- `total_score` (float): Total reward score for this response (sum of token-level scores)
 
 ## Integration Examples
 
@@ -236,6 +242,60 @@ plt.show()
 # Track divergence evolution over iterations
 divergence_by_iter = df.groupby('iteration')['prob_divergence'].agg(['mean', 'max', 'count'])
 print(divergence_by_iter)
+
+# ===== NEW: Analyze divergence by correctness =====
+# Filter by answer correctness
+correct_df = df[df['is_correct'] == True]
+incorrect_df = df[df['is_correct'] == False]
+
+print(f"\n=== Divergence Analysis by Correctness ===")
+print(f"Correct answers - Avg divergence: {correct_df['prob_divergence'].mean():.4f}")
+print(f"Incorrect answers - Avg divergence: {incorrect_df['prob_divergence'].mean():.4f}")
+print(f"Correct answers - Max divergence: {correct_df['prob_divergence'].max():.4f}")
+print(f"Incorrect answers - Max divergence: {incorrect_df['prob_divergence'].max():.4f}")
+
+# Analyze digit tokens by correctness
+digit_tokens = df[df['token_text'].str.strip().str.match(r'^[\d\.]+$')]
+print(f"\n=== Digit Token Analysis ===")
+print(f"Total digit tokens with high divergence: {len(digit_tokens)}")
+print(f"  From correct answers: {len(digit_tokens[digit_tokens['is_correct']])} ({len(digit_tokens[digit_tokens['is_correct']])/len(digit_tokens)*100:.1f}%)")
+print(f"  From incorrect answers: {len(digit_tokens[~digit_tokens['is_correct']])} ({len(digit_tokens[~digit_tokens['is_correct']])/len(digit_tokens)*100:.1f}%)")
+
+# Visualize divergence distribution by correctness
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].hist(correct_df['prob_divergence'], bins=30, alpha=0.7, label='Correct', color='green')
+axes[0].hist(incorrect_df['prob_divergence'], bins=30, alpha=0.7, label='Incorrect', color='red')
+axes[0].set_xlabel('Probability Divergence')
+axes[0].set_ylabel('Frequency')
+axes[0].set_title('Divergence Distribution by Correctness')
+axes[0].legend()
+
+# Plot divergence over training for correct vs incorrect
+correct_by_iter = correct_df.groupby('iteration')['prob_divergence'].mean()
+incorrect_by_iter = incorrect_df.groupby('iteration')['prob_divergence'].mean()
+axes[1].plot(correct_by_iter.index, correct_by_iter.values, 'g-', label='Correct', marker='o')
+axes[1].plot(incorrect_by_iter.index, incorrect_by_iter.values, 'r-', label='Incorrect', marker='s')
+axes[1].set_xlabel('Training Iteration')
+axes[1].set_ylabel('Average Divergence')
+axes[1].set_title('Divergence Evolution: Correct vs Incorrect')
+axes[1].legend()
+plt.tight_layout()
+plt.show()
+
+# Hypothesis testing: Are digit tokens more divergent in correct answers?
+digit_correct = digit_tokens[digit_tokens['is_correct']]
+digit_incorrect = digit_tokens[~digit_tokens['is_correct']]
+print(f"\n=== Hypothesis Test: Digit Token Divergence ===")
+print(f"Digit divergence (correct answers): {digit_correct['prob_divergence'].mean():.4f}")
+print(f"Digit divergence (incorrect answers): {digit_incorrect['prob_divergence'].mean():.4f}")
+if len(digit_correct) > 0 and len(digit_incorrect) > 0:
+    from scipy import stats
+    t_stat, p_value = stats.ttest_ind(digit_correct['prob_divergence'], digit_incorrect['prob_divergence'])
+    print(f"t-statistic: {t_stat:.4f}, p-value: {p_value:.4e}")
+    if p_value < 0.05:
+        print("→ Statistically significant difference! ✓")
 ```
 
 ### Using jq (command line)
@@ -252,6 +312,20 @@ cat logs/divergence.jsonl | jq 'select(.position < 10) | {token_text, prob_diver
 
 # Group by iteration
 cat logs/divergence.jsonl | jq -s 'group_by(.iteration) | map({iteration: .[0].iteration, count: length, avg_divergence: (map(.prob_divergence) | add / length)})'
+
+# ===== NEW: Correctness-based filtering =====
+# Count divergent tokens from correct vs incorrect answers
+cat logs/divergence.jsonl | jq 'select(.is_correct == true)' | wc -l
+cat logs/divergence.jsonl | jq 'select(.is_correct == false)' | wc -l
+
+# Find digit tokens from correct answers with high divergence
+cat logs/divergence.jsonl | jq 'select(.is_correct == true and .prob_divergence > 0.8) | select(.token_text | test("^[\"\\047]?[0-9\\.]+[\"\\047]?$"))'
+
+# Average divergence by correctness
+cat logs/divergence.jsonl | jq -s 'group_by(.is_correct) | map({is_correct: .[0].is_correct, count: length, avg_div: (map(.prob_divergence) | add / length), max_div: (map(.prob_divergence) | max)})'
+
+# Find cases where actor learned correct answer (high divergence + correct)
+cat logs/divergence.jsonl | jq 'select(.is_correct == true and .prob_divergence > 0.9 and .flip_type == "rollout_confident_actor_rejects")'
 ```
 
 ## Performance Considerations
@@ -289,6 +363,44 @@ PermissionError: [Errno 13] Permission denied
 from pathlib import Path
 Path("./logs").mkdir(parents=True, exist_ok=True)
 ```
+
+## Interpreting Correctness Results
+
+### Expected Patterns
+
+**Hypothesis 1: Actor learning correct answers faster than rollout**
+- **Expected:** High divergence on digit tokens from **correct** answers
+- **Interpretation:** Actor learned right digits, rollout lagging behind
+- **Evidence:** `is_correct=true` + high divergence + digit tokens
+
+**Example diagnostic questions:**
+```python
+# Q1: Are divergent tokens mostly from correct answers?
+correct_pct = (df['is_correct'].sum() / len(df)) * 100
+print(f"Divergent tokens from correct answers: {correct_pct:.1f}%")
+# If > 70%: Strong evidence for Hypothesis 1
+
+# Q2: Do digit tokens diverge more in correct answers?
+digit_correct_div = digit_tokens[digit_tokens['is_correct']]['prob_divergence'].mean()
+digit_incorrect_div = digit_tokens[~digit_tokens['is_correct']]['prob_divergence'].mean()
+print(f"Digit divergence ratio (correct/incorrect): {digit_correct_div/digit_incorrect_div:.2f}x")
+# If > 1.5x: Digits diverge more when answer is correct
+
+# Q3: What's the flip pattern?
+flip_patterns = df[df['is_correct']].groupby('flip_type').size()
+print(flip_patterns)
+# "rollout_confident_actor_rejects" suggests actor unlearning rollout's wrong answer
+```
+
+### Diagnostic Scenarios
+
+| Observation | Interpretation | Next Steps |
+|-------------|----------------|------------|
+| 80%+ divergent tokens from **correct** answers | ✅ Actor learning right answers | Confirms Hypothesis 1; normal behavior |
+| 80%+ divergent tokens from **incorrect** answers | ⚠️ Actor learning wrong answers | Check reward function; possible training instability |
+| Divergence equal on correct/incorrect | 🤔 Random divergence | May indicate TIS not helping; consider disabling |
+| Only digit tokens diverge (correct answers) | ✅ Expected for math tasks | Actor concentrating learning on answer-critical tokens |
+| Non-digit tokens diverge more | ⚠️ Unexpected pattern | Check prompt formatting; possible tokenization issues |
 
 ## Additional Fields to Log (Future Extensions)
 
