@@ -1068,10 +1068,32 @@ class RayPPOTrainer:
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
                             from verl.utils.debug.metrics import calculate_debug_metrics
 
-                            metrics.update(calculate_debug_metrics(batch))
+                            # Enable divergence logging output (only set once)
+                            if self.global_steps == 1:
+                                import logging
+                                logging.getLogger('verl.utils.debug.metrics').setLevel(logging.INFO)
+
+                            # Configure divergence logging
+                            divergence_log_path = self.config.trainer.get("divergence_log_path", None)
+                            if divergence_log_path is None:
+                                # Create default path in experiment directory
+                                divergence_log_path = os.path.join(
+                                    self.config.trainer.default_local_dir,
+                                    "divergence_logs.jsonl"
+                                )
+
+                            debug_metrics = calculate_debug_metrics(
+                                data=batch,
+                                tokenizer=self.tokenizer,
+                                log_divergence=True,
+                                divergence_threshold=self.config.trainer.get("divergence_threshold", 0.8),
+                                divergence_top_k=self.config.trainer.get("divergence_top_k", 5),
+                                divergence_jsonl_path=divergence_log_path,
+                                iteration=self.global_steps,
+                            )
+                            metrics.update(debug_metrics)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
