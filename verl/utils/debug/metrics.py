@@ -142,6 +142,13 @@ def extract_linguistic_context(
                 token_text = tokenizer.decode([token_id])
                 log_entry["token_text"] = repr(token_text)
 
+                # DIAGNOSTIC: Log if this exact token would tokenize differently
+                # This helps detect tokenizer inconsistencies
+                reencoded = tokenizer.encode(token_text, add_special_tokens=False)
+                log_entry["reencodes_to_same_id"] = (len(reencoded) == 1 and reencoded[0] == token_id)
+                if len(reencoded) != 1 or reencoded[0] != token_id:
+                    log_entry["reencoded_ids"] = reencoded
+
                 # Extract context window (±context_window tokens)
                 context_start = max(0, seq_idx - context_window)
                 context_end = min(seq_len, seq_idx + context_window + 1)
