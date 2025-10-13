@@ -167,16 +167,33 @@ def extract_linguistic_context(
                 # Extract prompt if available
                 if "input_ids" in data.batch:
                     input_ids = data.batch["input_ids"][batch_idx]
-                    # Prompt is everything before the response
-                    prompt_length = len(input_ids) - len(responses[batch_idx])
-                    if prompt_length > 0:
-                        prompt_ids = input_ids[:prompt_length].tolist()
-                        prompt_text = tokenizer.decode(prompt_ids)
-                        # Truncate if too long
-                        if len(prompt_text) > max_prompt_chars:
-                            prompt_text = prompt_text[:max_prompt_chars] + "..."
-                        log_entry["prompt_text"] = repr(prompt_text)
-                        log_entry["prompt_num_tokens"] = prompt_length
+                    # Use attention_mask to identify valid tokens (skip left-padding)
+                    if "attention_mask" in data.batch:
+                        attention_mask_full = data.batch["attention_mask"][batch_idx]
+                        # Find the first valid token (where attention_mask == 1)
+                        valid_indices = (attention_mask_full == 1).nonzero(as_tuple=True)[0]
+                        if len(valid_indices) > 0:
+                            start_idx = valid_indices[0].item()
+                            # Prompt is from first valid token to where response starts
+                            prompt_length = len(input_ids) - len(responses[batch_idx]) - start_idx
+                            if prompt_length > 0:
+                                prompt_ids = input_ids[start_idx:start_idx + prompt_length].tolist()
+                                prompt_text = tokenizer.decode(prompt_ids)
+                                # Truncate if too long
+                                if len(prompt_text) > max_prompt_chars:
+                                    prompt_text = prompt_text[:max_prompt_chars] + "..."
+                                log_entry["prompt_text"] = repr(prompt_text)
+                                log_entry["prompt_num_tokens"] = prompt_length
+                    else:
+                        # Fallback: assume no padding (for backward compatibility)
+                        prompt_length = len(input_ids) - len(responses[batch_idx])
+                        if prompt_length > 0:
+                            prompt_ids = input_ids[:prompt_length].tolist()
+                            prompt_text = tokenizer.decode(prompt_ids)
+                            if len(prompt_text) > max_prompt_chars:
+                                prompt_text = prompt_text[:max_prompt_chars] + "..."
+                            log_entry["prompt_text"] = repr(prompt_text)
+                            log_entry["prompt_num_tokens"] = prompt_length
 
             except Exception as e:
                 logger.warning(f"Failed to decode token {token_id}: {e}")
