@@ -71,9 +71,9 @@ def extract_linguistic_context(
     data: DataProto,
     tokenizer=None,
     top_k: int = 5,
-    context_window: int = 5,
-    max_prompt_chars: int = 200,
-    max_response_chars: int = 200,
+    context_window: int = 20,
+    max_prompt_chars: int = None,
+    max_response_chars: int = None,
 ) -> list[dict]:
     """
     Extract linguistic context for tokens with high divergence between rollout and actor.
@@ -120,6 +120,15 @@ def extract_linguistic_context(
         rollout_logprob = rollout_log_probs[batch_idx, seq_idx].item()
         actor_logprob = actor_log_probs[batch_idx, seq_idx].item()
 
+        # Classify the type of divergence
+        flip_type = None
+        if rollout_prob > 0.9 and actor_prob < 0.1:
+            flip_type = "rollout_confident_actor_rejects"
+        elif actor_prob > 0.9 and rollout_prob < 0.1:
+            flip_type = "actor_confident_rollout_rejects"
+        elif abs(rollout_prob - actor_prob) > 0.5:
+            flip_type = "large_disagreement"
+
         log_entry = {
             "rank": rank,
             "batch_idx": batch_idx,
@@ -133,6 +142,7 @@ def extract_linguistic_context(
             "rollout_logprob": rollout_logprob,
             "actor_logprob": actor_logprob,
             "logprob_diff": abs(rollout_logprob - actor_logprob),
+            "flip_type": flip_type,
         }
 
         # Decode token and context if tokenizer available
@@ -165,11 +175,26 @@ def extract_linguistic_context(
                     tid for tid, mask in zip(response_ids, response_mask_sample) if mask > 0
                 ]
                 full_response = tokenizer.decode(valid_response_ids)
-                # Truncate if too long
-                if len(full_response) > max_response_chars:
+                # Truncate if too long (only if max_response_chars is specified)
+                if max_response_chars is not None and len(full_response) > max_response_chars:
                     full_response = full_response[:max_response_chars] + "..."
                 log_entry["full_response"] = repr(full_response)
                 log_entry["response_num_tokens"] = len(valid_response_ids)
+
+                # Check if the token in responses matches the token in input_ids
+                if "input_ids" in data.batch:
+                    input_ids = data.batch["input_ids"][batch_idx]
+                    # Calculate position in full input_ids sequence
+                    # input_ids = [prompt | response], we need to find where this response token is
+                    full_seq_pos = len(input_ids) - seq_len + seq_idx
+                    if 0 <= full_seq_pos < len(input_ids):
+                        input_ids_token = input_ids[full_seq_pos].item()
+                        log_entry["input_ids_token_id"] = input_ids_token
+                        log_entry["tokens_match"] = (input_ids_token == token_id)
+                        if input_ids_token != token_id:
+                            log_entry["WARNING"] = f"MISMATCH! response has {token_id} but input_ids has {input_ids_token}"
+                            if tokenizer is not None:
+                                log_entry["input_ids_token_text"] = repr(tokenizer.decode([input_ids_token]))
 
                 # Extract prompt if available
                 if "input_ids" in data.batch:
@@ -186,8 +211,8 @@ def extract_linguistic_context(
                             if prompt_length > 0:
                                 prompt_ids = input_ids[start_idx:start_idx + prompt_length].tolist()
                                 prompt_text = tokenizer.decode(prompt_ids)
-                                # Truncate if too long
-                                if len(prompt_text) > max_prompt_chars:
+                                # Truncate if too long (only if max_prompt_chars is specified)
+                                if max_prompt_chars is not None and len(prompt_text) > max_prompt_chars:
                                     prompt_text = prompt_text[:max_prompt_chars] + "..."
                                 log_entry["prompt_text"] = repr(prompt_text)
                                 log_entry["prompt_num_tokens"] = prompt_length
@@ -197,7 +222,7 @@ def extract_linguistic_context(
                         if prompt_length > 0:
                             prompt_ids = input_ids[:prompt_length].tolist()
                             prompt_text = tokenizer.decode(prompt_ids)
-                            if len(prompt_text) > max_prompt_chars:
+                            if max_prompt_chars is not None and len(prompt_text) > max_prompt_chars:
                                 prompt_text = prompt_text[:max_prompt_chars] + "..."
                             log_entry["prompt_text"] = repr(prompt_text)
                             log_entry["prompt_num_tokens"] = prompt_length
@@ -269,6 +294,20 @@ def log_divergence_human_readable(divergence_logs: list[dict]):
         logger.info(f"  Actor:   prob={log_entry['actor_prob']:.6f}, logprob={log_entry['actor_logprob']:.4f}")
         logger.info(f"  LogProb Diff: {log_entry['logprob_diff']:.4f}")
 
+        if log_entry.get('flip_type'):
+            logger.info(f"  Flip Type: {log_entry['flip_type']}")
+
+        if 'tokens_match' in log_entry:
+            if log_entry['tokens_match']:
+                logger.info(f"  Token Alignment: ✓ MATCH (response token matches input_ids)")
+            else:
+                logger.warning(f"  Token Alignment: ✗ MISMATCH!")
+                logger.warning(f"    Response token: {log_entry.get('token_text', 'N/A')} (ID: {log_entry['token_id']})")
+                logger.warning(f"    Input_ids token: {log_entry.get('input_ids_token_text', 'N/A')} (ID: {log_entry.get('input_ids_token_id', 'N/A')})")
+
+        if 'WARNING' in log_entry:
+            logger.warning(f"  WARNING: {log_entry['WARNING']}")
+
         if "context_text" in log_entry:
             logger.info(f"  Context [{log_entry['context_start_pos']}:{log_entry['context_end_pos']}]: "
                        f"{log_entry['context_text']}")
@@ -292,7 +331,7 @@ def calculate_debug_metrics(
     tokenizer=None,
     log_divergence: bool = True,
     divergence_threshold: float = 0.8,
-    divergence_top_k: int = 5,
+    divergence_top_k: int = 20,
     divergence_jsonl_path: str = None,
     iteration: int = None,
 ) -> dict:
@@ -364,17 +403,21 @@ def calculate_debug_metrics(
             data=data,
             tokenizer=tokenizer,
             top_k=divergence_top_k,
-            context_window=5,
-            max_prompt_chars=200,
-            max_response_chars=200,
+            context_window=20,
+            max_prompt_chars=None,
+            max_response_chars=None,
         )
 
         if divergence_logs:
-            # Log to Python logging (human-readable)
-            log_divergence_human_readable(divergence_logs)
-
-            # Write to JSONL file if path provided
+            # Write to JSONL file (primary output)
             if divergence_jsonl_path is not None:
                 write_divergence_logs_to_jsonl(divergence_logs, divergence_jsonl_path, iteration)
+                logger.info(f"Wrote {len(divergence_logs)} divergence logs to {divergence_jsonl_path}")
+            else:
+                logger.warning("divergence_jsonl_path is None - divergence logs will not be saved to file!")
+
+            # Optional: Log to console (may not be visible depending on log level)
+            # Uncomment the line below if you want console output:
+            # log_divergence_human_readable(divergence_logs)
 
     return metrics

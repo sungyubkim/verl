@@ -1089,7 +1089,7 @@ class RayPPOTrainer:
                                 tokenizer=self.tokenizer,
                                 log_divergence=True,
                                 divergence_threshold=self.config.trainer.get("divergence_threshold", 0.8),
-                                divergence_top_k=self.config.trainer.get("divergence_top_k", 5),
+                                divergence_top_k=self.config.trainer.get("divergence_top_k", 20),
                                 divergence_jsonl_path=divergence_log_path,
                                 iteration=self.global_steps,
                             )
