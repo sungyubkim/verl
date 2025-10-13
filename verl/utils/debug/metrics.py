@@ -353,7 +353,4 @@ def calculate_debug_metrics(
             if divergence_jsonl_path is not None:
                 write_divergence_logs_to_jsonl(divergence_logs, divergence_jsonl_path, iteration)
 
-            # Include in metrics for external logging systems
-            metrics["training/high_divergence_tokens"] = divergence_logs
-
     return metrics
