@@ -11,29 +11,72 @@ The Weighted Dataset Sampling feature allows you to control the mixing ratio of 
 
 ## How It Works
 
-When training with multiple datasets, VERL normally concatenates all datasets and samples uniformly. With weighted sampling, you can specify the exact proportion of samples to draw from each dataset per epoch.
+### File-Based Tracking (Automatic)
+
+When you load multiple datasets with RLHFDataset, each sample is **automatically tagged** with:
+- `_file_index`: Integer indicating which file it came from (0, 1, 2, ...)
+- `_source_file`: Original file path (for debugging)
+
+The WeightedDatasetSampler uses `_file_index` to identify which file each sample belongs to, then applies the corresponding ratio from `dataset_ratios`.
+
+**Important**: The order of `dataset_ratios` **EXACTLY matches** the order of files in `train_files`.
 
 ### Key Concepts
 
-1. **Dataset Ratios**: A list of floats specifying the proportion of samples from each dataset
-2. **Epoch Size**: The total number of samples per epoch (default: size of largest dataset)
-3. **Over-sampling**: Small datasets are sampled with replacement to meet the ratio
-4. **Under-sampling**: Large datasets are sampled without replacement
+1. **Dataset Ratios**: A list of floats specifying the proportion of samples from each **file** (not data_source)
+2. **File Order = Ratio Order**: First ratio applies to first file, second ratio to second file, etc.
+3. **Epoch Size**: The total number of samples per epoch (default: size of largest file)
+4. **Over-sampling**: Small files are sampled with replacement to meet the ratio
+5. **Under-sampling**: Large files are sampled without replacement
+6. **No Preprocessing**: Files are automatically tracked, no manual setup needed
 
 ### Example
 
-Suppose you have two datasets:
-- **GSM8K**: 7,000 training samples
-- **MATH**: 1,000 training samples
+Suppose you have two files:
+- **gsm8k.parquet**: 7,000 training samples
+- **math.parquet**: 1,000 training samples
+
+```yaml
+train_files: [gsm8k.parquet, math.parquet]
+dataset_ratios: [0.5, 0.5]  # 50% from each FILE
+```
 
 **Without weighted sampling** (default):
 - Each epoch uses all 8,000 samples
 - GSM8K: 87.5%, MATH: 12.5%
 
 **With weighted sampling** (`dataset_ratios: [0.5, 0.5]`):
-- Each epoch uses 7,000 samples (size of largest dataset)
-- GSM8K: 3,500 samples (50%, under-sampled)
-- MATH: 3,500 samples (50%, over-sampled with replacement)
+- Each epoch uses 7,000 samples (size of largest file)
+- GSM8K: 3,500 samples (50%, under-sampled) ← File 0
+- MATH: 3,500 samples (50%, over-sampled with replacement) ← File 1
+
+**Startup Logs**:
+```
+================================================================================
+WeightedDatasetSampler Configuration
+================================================================================
+Total samples in dataset: 8000
+Epoch size: 7000
+Number of files: 2
+
+File mapping:
+  File 0: ~/data/gsm8k.parquet
+  File 1: ~/data/math.parquet
+
+Per-file sampling:
+  File 0 (~/data/gsm8k.parquet):
+    - Original size: 7000
+    - Ratio: 50.00%
+    - Samples per epoch: 3500
+    - Mode: under-sampling (0.50x)
+
+  File 1 (~/data/math.parquet):
+    - Original size: 1000
+    - Ratio: 50.00%
+    - Samples per epoch: 3500
+    - Mode: over-sampling (with replacement) (3.50x)
+================================================================================
+```
 
 ## Usage
 
@@ -129,31 +172,38 @@ The weighted sampling is implemented via `WeightedDatasetSampler` class in `verl
 **How it works**:
 
 1. **Initialization**:
-   - Reads each sample's `data_source` field to identify which dataset it comes from
-   - Builds an index mapping for each dataset
-   - Validates that number of ratios matches number of datasets
+   - Reads each sample's `_file_index` field to identify which file it comes from
+   - Builds an index mapping from file index to sample indices
+   - Validates that number of ratios matches number of files
+   - Logs file mapping and sampling statistics
 
 2. **Sampling**:
-   - For each epoch, calculates how many samples to draw from each dataset
-   - Uses `np.random.choice` with `replace=True` for over-sampling
-   - Uses `np.random.choice` with `replace=False` for under-sampling
+   - For each epoch, calculates how many samples to draw from each file based on ratios
+   - Uses `np.random.choice` with `replace=True` for over-sampling (small files)
+   - Uses `np.random.choice` with `replace=False` for under-sampling (large files)
    - Shuffles all sampled indices together
 
 3. **Integration**:
    - Automatically activated when `dataset_ratios` is specified in config
    - Integrated into `create_rl_sampler()` in `main_ppo.py`
 
-### Data Source Field
+### Automatic File Tracking
 
-Each sample in your dataset must have a `data_source` field indicating which dataset it comes from. This is automatically added when using `RLHFDataset` with multiple parquet files.
+**No manual setup required!** When using `RLHFDataset` to load multiple parquet files, each sample is automatically tagged with:
 
-Example sample:
+- `_file_index`: Integer indicating which file it came from (0, 1, 2, ...)
+- `_source_file`: Original file path (for debugging and logging)
+
+These columns are added automatically by `RLHFDataset._read_files_and_tokenize()` method.
+
+Example sample after loading:
 ```python
 {
-    'data_source': 'gsm8k',  # or 'math', etc.
+    '_file_index': 0,
+    '_source_file': '~/data/gsm8k/train.parquet',
     'prompt': 'What is 2+2?',
     'response': '4',
-    # ... other fields
+    # ... other fields from your parquet file
 }
 ```
 
@@ -278,9 +328,24 @@ Potential future enhancements:
 
 Make sure to set `dataset_ratios` in your config when using `WeightedDatasetSampler`.
 
-### Error: "Number of dataset_ratios must match number of unique datasets"
+### Error: "_file_index column is required"
+
+This error means the dataset doesn't have the `_file_index` column. This usually happens if:
+- You're not using `RLHFDataset` to load your data
+- You're using a custom dataset class that doesn't add `_file_index`
+
+**Solution**: Make sure you're using `RLHFDataset` to load your parquet files. The `_file_index` column is automatically added when loading multiple files.
+
+### Error: "Number of dataset_ratios must match number of files"
 
 The number of values in `dataset_ratios` must match the number of files in `train_files`.
+
+Example:
+```yaml
+train_files: [file1.parquet, file2.parquet, file3.parquet]
+dataset_ratios: [0.5, 0.3, 0.2]  # ✅ Correct: 3 files, 3 ratios
+# dataset_ratios: [0.5, 0.5]     # ❌ Error: 3 files, 2 ratios
+```
 
 ### Error: "num_workers must be 0"
 

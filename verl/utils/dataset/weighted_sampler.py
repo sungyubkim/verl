@@ -108,42 +108,78 @@ class WeightedDatasetSampler(AbstractSampler):
         print("\n" + "=" * 80)
         print("WeightedDatasetSampler Configuration")
         print("=" * 80)
+        print(f"Total samples in dataset: {len(data_source)}")
         print(f"Epoch size: {self.epoch_size}")
-        print(f"Total samples in concatenated dataset: {len(data_source)}")
-        print("\nPer-dataset sampling:")
-        for i, (dataset_name, indices) in enumerate(self.dataset_indices.items()):
-            ratio = self.dataset_ratios[i]
+        print(f"Number of files: {len(self.dataset_indices)}")
+
+        # Show file mapping if available
+        if hasattr(data_source, 'dataframe') and '_source_file' in data_source.dataframe.column_names:
+            print("\nFile mapping:")
+            for file_idx in sorted(self.dataset_indices.keys()):
+                # Get source file name from first sample of this file
+                sample_idx = self.dataset_indices[file_idx][0]
+                source_file = data_source.dataframe[sample_idx]['_source_file']
+                print(f"  File {file_idx}: {source_file}")
+
+        print("\nPer-file sampling:")
+        for file_idx in sorted(self.dataset_indices.keys()):
+            indices = self.dataset_indices[file_idx]
+            ratio = self.dataset_ratios[file_idx]
             n_samples = int(self.epoch_size * ratio)
+
             sampling_mode = "over-sampling (with replacement)" if n_samples > len(indices) else "under-sampling"
             repetition = n_samples / len(indices) if len(indices) > 0 else 0
-            print(f"  Dataset '{dataset_name}':")
+
+            # Get file name if available
+            file_name = "unknown"
+            if hasattr(data_source, 'dataframe') and '_source_file' in data_source.dataframe.column_names:
+                sample_idx = indices[0]
+                file_name = data_source.dataframe[sample_idx]['_source_file']
+
+            print(f"  File {file_idx} ({file_name}):")
             print(f"    - Original size: {len(indices)}")
             print(f"    - Ratio: {ratio:.2%}")
             print(f"    - Samples per epoch: {n_samples}")
             print(f"    - Mode: {sampling_mode} ({repetition:.2f}x)")
         print("=" * 80 + "\n")
 
-    def _build_dataset_indices(self) -> dict[str, list[int]]:
-        """Build a mapping from dataset name to list of indices.
+    def _build_dataset_indices(self) -> dict[int, list[int]]:
+        """Build a mapping from file_index to list of sample indices.
+
+        This method uses the _file_index column, which is automatically added
+        by RLHFDataset when loading multiple files.
 
         Returns:
-            Dictionary mapping dataset name to list of sample indices.
+            Dictionary mapping file_index (int) to list of sample indices.
+
+        Raises:
+            ValueError: If _file_index column is not found in the dataset.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         dataset_indices = defaultdict(list)
 
         # Check if dataset has a dataframe attribute (for RLHFDataset)
         if hasattr(self.data_source, 'dataframe'):
-            # Efficiently extract data_source column
             dataframe = self.data_source.dataframe
-            if 'data_source' not in dataframe.column_names:
+
+            # _file_index is REQUIRED
+            if '_file_index' not in dataframe.column_names:
                 raise ValueError(
-                    "Dataset must have a 'data_source' column to use WeightedDatasetSampler. "
-                    f"Available columns: {dataframe.column_names}"
+                    "_file_index column is required for WeightedDatasetSampler.\n"
+                    f"Available columns: {dataframe.column_names}\n\n"
+                    "This column is automatically added by RLHFDataset when loading files.\n"
+                    "Make sure you are using RLHFDataset to load your data files."
                 )
 
-            data_sources = dataframe['data_source']
-            for idx, source in enumerate(data_sources):
-                dataset_indices[source].append(idx)
+            # Build index mapping
+            file_indices = dataframe['_file_index']
+            for idx, file_idx in enumerate(file_indices):
+                dataset_indices[file_idx].append(idx)
+
+            logger.info(f"Built dataset indices from _file_index: {len(dataset_indices)} files")
+
         else:
             # Fallback: iterate through dataset (slower)
             warnings.warn(
@@ -152,13 +188,16 @@ class WeightedDatasetSampler(AbstractSampler):
             )
             for idx in range(len(self.data_source)):
                 item = self.data_source[idx]
-                if 'data_source' not in item:
+
+                if '_file_index' not in item:
                     raise ValueError(
-                        f"Sample at index {idx} does not have 'data_source' field. "
-                        "All samples must have 'data_source' to use WeightedDatasetSampler."
+                        f"Sample at index {idx} is missing '_file_index' field.\n"
+                        "This field is required for WeightedDatasetSampler.\n"
+                        f"Available keys: {list(item.keys())}"
                     )
-                source = item['data_source']
-                dataset_indices[source].append(idx)
+
+                file_idx = item['_file_index']
+                dataset_indices[file_idx].append(idx)
 
         return dict(dataset_indices)
 

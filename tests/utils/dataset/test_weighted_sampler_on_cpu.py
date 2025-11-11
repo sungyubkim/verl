@@ -12,35 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Test WeightedDatasetSampler for dataset ratio control.
+Test WeightedDatasetSampler for dataset ratio control (file-based).
 """
 
-import warnings
 from collections import Counter
 
 import datasets
 import numpy as np
 import pytest
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 
 from verl.utils.dataset.weighted_sampler import WeightedDatasetSampler
 
 
 class MockRLHFDataset:
-    """Mock dataset that mimics RLHFDataset structure."""
+    """Mock dataset that mimics RLHFDataset structure with _file_index."""
 
-    def __init__(self, dataset_sources: list[tuple[str, int]]):
+    def __init__(self, file_counts: list[tuple[int, int]]):
         """
         Args:
-            dataset_sources: List of (source_name, count) tuples.
-                Example: [('gsm8k', 7000), ('math', 1000)]
+            file_counts: List of (file_idx, count) tuples.
+                Example: [(0, 7000), (1, 1000)]
         """
         data_dicts = []
-        for source_name, count in dataset_sources:
+        for file_idx, count in file_counts:
             for i in range(count):
                 data_dicts.append({
-                    'data_source': source_name,
-                    'prompt': f'{source_name}_prompt_{i}',
+                    '_file_index': file_idx,
+                    '_source_file': f'file_{file_idx}.parquet',
+                    'prompt': f'file{file_idx}_prompt_{i}',
                     'index': i,
                 })
 
@@ -54,10 +54,10 @@ class MockRLHFDataset:
 
 
 def test_basic_weighted_sampling():
-    """Test basic weighted sampling with two datasets."""
+    """Test basic weighted sampling with two files."""
     dataset = MockRLHFDataset([
-        ('gsm8k', 7000),
-        ('math', 1000),
+        (0, 7000),  # File 0: 7000 samples
+        (1, 1000),  # File 1: 1000 samples
     ])
 
     data_config = OmegaConf.create({
@@ -79,8 +79,8 @@ def test_basic_weighted_sampling():
 def test_sampling_ratios_over_multiple_epochs():
     """Test that ratios are maintained over multiple epochs."""
     dataset = MockRLHFDataset([
-        ('dataset_a', 1000),
-        ('dataset_b', 500),
+        (0, 1000),
+        (1, 500),
     ])
 
     data_config = OmegaConf.create({
@@ -94,27 +94,27 @@ def test_sampling_ratios_over_multiple_epochs():
     for epoch in range(3):
         indices = list(sampler)
 
-        # Count sources
-        source_counts = Counter()
+        # Count by file_index
+        file_counts = Counter()
         for idx in indices:
-            source = dataset[idx]['data_source']
-            source_counts[source] += 1
+            file_idx = dataset[idx]['_file_index']
+            file_counts[file_idx] += 1
 
-        total = sum(source_counts.values())
+        total = sum(file_counts.values())
 
         # Check ratios (with some tolerance for randomness)
-        dataset_a_ratio = source_counts['dataset_a'] / total
-        dataset_b_ratio = source_counts['dataset_b'] / total
+        file_0_ratio = file_counts[0] / total
+        file_1_ratio = file_counts[1] / total
 
-        assert abs(dataset_a_ratio - 0.6) < 0.01, f"Epoch {epoch}: dataset_a ratio {dataset_a_ratio}"
-        assert abs(dataset_b_ratio - 0.4) < 0.01, f"Epoch {epoch}: dataset_b ratio {dataset_b_ratio}"
+        assert abs(file_0_ratio - 0.6) < 0.01, f"Epoch {epoch}: file 0 ratio {file_0_ratio}"
+        assert abs(file_1_ratio - 0.4) < 0.01, f"Epoch {epoch}: file 1 ratio {file_1_ratio}"
 
 
 def test_over_sampling_with_replacement():
-    """Test that small datasets are over-sampled with replacement."""
+    """Test that small files are over-sampled with replacement."""
     dataset = MockRLHFDataset([
-        ('large', 5000),
-        ('small', 100),
+        (0, 5000),
+        (1, 100),   # Small file
     ])
 
     data_config = OmegaConf.create({
@@ -125,29 +125,28 @@ def test_over_sampling_with_replacement():
     sampler = WeightedDatasetSampler(dataset, data_config)
     indices = list(sampler)
 
-    # Count how many times each index appears
-    small_dataset_indices = [i for i in range(100)]  # First 100 are from 'small'
-    small_dataset_samples = [idx for idx in indices if idx < 100]
+    # Count how many samples from file 1 (small file)
+    file_1_samples = [idx for idx in indices if dataset[idx]['_file_index'] == 1]
 
-    # Should have ~2500 samples from small dataset (50% of 5000)
-    # Since small dataset only has 100 samples, they must be repeated
-    assert len(small_dataset_samples) > 100, "Small dataset should be over-sampled"
+    # Should have ~2500 samples from file 1 (50% of 5000)
+    # Since file 1 only has 100 samples, they must be repeated
+    assert len(file_1_samples) > 100, "File 1 should be over-sampled"
 
     # Some indices should appear multiple times
-    index_counts = Counter(small_dataset_samples)
+    index_counts = Counter(file_1_samples)
     max_count = max(index_counts.values())
-    assert max_count > 1, "Some samples from small dataset should be repeated"
+    assert max_count > 1, "Some samples from file 1 should be repeated"
 
 
 def test_under_sampling():
-    """Test that large datasets are under-sampled."""
+    """Test that large files are under-sampled."""
     dataset = MockRLHFDataset([
-        ('large', 10000),
-        ('small', 1000),
+        (0, 10000),  # Large file
+        (1, 1000),
     ])
 
     data_config = OmegaConf.create({
-        'dataset_ratios': [0.3, 0.7],  # More from small dataset
+        'dataset_ratios': [0.3, 0.7],  # More from small file
         'epoch_size': 5000,
         'seed': 42,
     })
@@ -155,23 +154,23 @@ def test_under_sampling():
     sampler = WeightedDatasetSampler(dataset, data_config)
     indices = list(sampler)
 
-    # Count sources
-    source_counts = Counter()
+    # Count by file_index
+    file_counts = Counter()
     for idx in indices:
-        source = dataset[idx]['data_source']
-        source_counts[source] += 1
+        file_idx = dataset[idx]['_file_index']
+        file_counts[file_idx] += 1
 
-    # Large dataset should be under-sampled (only 1500 out of 10000)
-    assert source_counts['large'] == 1500
-    # Small dataset should be over-sampled (3500 out of 1000)
-    assert source_counts['small'] == 3500
+    # File 0 should be under-sampled (only 1500 out of 10000)
+    assert file_counts[0] == 1500
+    # File 1 should be over-sampled (3500 out of 1000)
+    assert file_counts[1] == 3500
 
 
 def test_custom_epoch_size():
     """Test custom epoch size setting."""
     dataset = MockRLHFDataset([
-        ('dataset_a', 1000),
-        ('dataset_b', 500),
+        (0, 1000),
+        (1, 500),
     ])
 
     data_config = OmegaConf.create({
@@ -192,8 +191,8 @@ def test_custom_epoch_size():
 def test_ratio_normalization():
     """Test that ratios are normalized if they don't sum to 1.0."""
     dataset = MockRLHFDataset([
-        ('dataset_a', 1000),
-        ('dataset_b', 500),
+        (0, 1000),
+        (1, 500),
     ])
 
     data_config = OmegaConf.create({
@@ -201,6 +200,7 @@ def test_ratio_normalization():
         'seed': 42,
     })
 
+    import warnings
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         sampler = WeightedDatasetSampler(dataset, data_config)
@@ -210,17 +210,17 @@ def test_ratio_normalization():
         assert "normalizing to 1.0" in str(w[0].message)
 
     # Ratios should be normalized
-    expected_ratio_a = 0.7 / 0.9
-    expected_ratio_b = 0.2 / 0.9
+    expected_ratio_0 = 0.7 / 0.9
+    expected_ratio_1 = 0.2 / 0.9
 
-    assert abs(sampler.dataset_ratios[0] - expected_ratio_a) < 0.001
-    assert abs(sampler.dataset_ratios[1] - expected_ratio_b) < 0.001
+    assert abs(sampler.dataset_ratios[0] - expected_ratio_0) < 0.001
+    assert abs(sampler.dataset_ratios[1] - expected_ratio_1) < 0.001
 
 
 def test_missing_dataset_ratios():
     """Test that missing dataset_ratios raises an error."""
     dataset = MockRLHFDataset([
-        ('dataset_a', 1000),
+        (0, 1000),
     ])
 
     data_config = OmegaConf.create({
@@ -231,15 +231,15 @@ def test_missing_dataset_ratios():
         WeightedDatasetSampler(dataset, data_config)
 
 
-def test_mismatched_ratios_and_datasets():
-    """Test that mismatched number of ratios and datasets raises an error."""
+def test_mismatched_ratios_and_files():
+    """Test that mismatched number of ratios and files raises an error."""
     dataset = MockRLHFDataset([
-        ('dataset_a', 1000),
-        ('dataset_b', 500),
+        (0, 1000),
+        (1, 500),
     ])
 
     data_config = OmegaConf.create({
-        'dataset_ratios': [0.5, 0.3, 0.2],  # 3 ratios but only 2 datasets
+        'dataset_ratios': [0.5, 0.3, 0.2],  # 3 ratios but only 2 files
         'seed': 42,
     })
 
@@ -247,10 +247,64 @@ def test_mismatched_ratios_and_datasets():
         WeightedDatasetSampler(dataset, data_config)
 
 
-def test_single_dataset_with_ratio():
-    """Test that single dataset works with ratio=1.0."""
+def test_file_index_required():
+    """Test that _file_index column is required."""
+    # Dataset without _file_index
+    data = [{'prompt': 'Q1'} for _ in range(10)]
+    dataset_obj = datasets.Dataset.from_list(data)
+
+    class MockDatasetWithoutFileIndex:
+        def __init__(self):
+            self.dataframe = dataset_obj
+
+        def __len__(self):
+            return len(self.dataframe)
+
+    dataset = MockDatasetWithoutFileIndex()
+
+    data_config = OmegaConf.create({
+        'dataset_ratios': [1.0],
+        'seed': 42,
+    })
+
+    with pytest.raises(ValueError, match="_file_index column is required"):
+        WeightedDatasetSampler(dataset, data_config)
+
+
+def test_file_index_order_matches_ratio_order():
+    """Test that file_index order matches ratio order exactly."""
     dataset = MockRLHFDataset([
-        ('dataset_a', 1000),
+        (0, 5000),
+        (1, 3000),
+        (2, 2000),
+    ])
+
+    data_config = OmegaConf.create({
+        'dataset_ratios': [0.5, 0.3, 0.2],  # File 0: 50%, File 1: 30%, File 2: 20%
+        'seed': 42,
+    })
+
+    sampler = WeightedDatasetSampler(dataset, data_config)
+    indices = list(sampler)
+
+    # Count by file_index
+    counts = {0: 0, 1: 0, 2: 0}
+    for idx in indices:
+        file_idx = dataset[idx]['_file_index']
+        counts[file_idx] += 1
+
+    total = sum(counts.values())
+
+    # Verify ratios
+    assert abs(counts[0] / total - 0.5) < 0.01
+    assert abs(counts[1] / total - 0.3) < 0.01
+    assert abs(counts[2] / total - 0.2) < 0.01
+
+
+def test_single_file_with_ratio():
+    """Test that single file works with ratio=1.0."""
+    dataset = MockRLHFDataset([
+        (0, 1000),
     ])
 
     data_config = OmegaConf.create({
@@ -267,8 +321,8 @@ def test_single_dataset_with_ratio():
 def test_reproducibility_with_seed():
     """Test that sampling is reproducible with the same seed."""
     dataset = MockRLHFDataset([
-        ('dataset_a', 1000),
-        ('dataset_b', 500),
+        (0, 1000),
+        (1, 500),
     ])
 
     data_config = OmegaConf.create({
@@ -289,8 +343,8 @@ def test_reproducibility_with_seed():
 def test_different_seeds_produce_different_samples():
     """Test that different seeds produce different sampling orders."""
     dataset = MockRLHFDataset([
-        ('dataset_a', 1000),
-        ('dataset_b', 500),
+        (0, 1000),
+        (1, 500),
     ])
 
     data_config1 = OmegaConf.create({
@@ -311,57 +365,3 @@ def test_different_seeds_produce_different_samples():
 
     # Should be different
     assert indices1 != indices2
-
-
-def test_three_datasets():
-    """Test with three datasets."""
-    dataset = MockRLHFDataset([
-        ('dataset_a', 5000),
-        ('dataset_b', 2000),
-        ('dataset_c', 500),
-    ])
-
-    data_config = OmegaConf.create({
-        'dataset_ratios': [0.5, 0.3, 0.2],
-        'seed': 42,
-    })
-
-    sampler = WeightedDatasetSampler(dataset, data_config)
-    indices = list(sampler)
-
-    # Count sources
-    source_counts = Counter()
-    for idx in indices:
-        source = dataset[idx]['data_source']
-        source_counts[source] += 1
-
-    total = sum(source_counts.values())
-
-    # Check ratios
-    assert abs(source_counts['dataset_a'] / total - 0.5) < 0.01
-    assert abs(source_counts['dataset_b'] / total - 0.3) < 0.01
-    assert abs(source_counts['dataset_c'] / total - 0.2) < 0.01
-
-
-def test_missing_data_source_field():
-    """Test that missing data_source field raises an error."""
-    # Create dataset without data_source field
-    data_dicts = [{'prompt': f'prompt_{i}'} for i in range(100)]
-    dataset = datasets.Dataset.from_list(data_dicts)
-
-    class MockDatasetWithoutDataSource:
-        def __init__(self):
-            self.dataframe = dataset
-
-        def __len__(self):
-            return len(self.dataframe)
-
-    mock_dataset = MockDatasetWithoutDataSource()
-
-    data_config = OmegaConf.create({
-        'dataset_ratios': [1.0],
-        'seed': 42,
-    })
-
-    with pytest.raises(ValueError, match="must have a 'data_source' column"):
-        WeightedDatasetSampler(mock_dataset, data_config)

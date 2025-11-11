@@ -16,9 +16,15 @@ val_files: ~/data/rlhf/gsm8k/test.parquet
 # Dataset mixing ratios (optional). Only used when train_files contains multiple datasets.
 # Specifies the proportion of samples to draw from each dataset per epoch.
 # Must be a list of floats that sum to approximately 1.0.
-# Order corresponds to the order of datasets in train_files.
+# Order corresponds EXACTLY to the order of files in train_files (not data_source values).
 # If null, all datasets are simply concatenated without ratio control (default behavior).
-# Example: [0.7, 0.3] means 70% from first dataset, 30% from second dataset.
+#
+# Example:
+#   train_files: [gsm8k.parquet, math.parquet, code.parquet]
+#   dataset_ratios: [0.5, 0.3, 0.2]
+#   → 50% from gsm8k.parquet, 30% from math.parquet, 20% from code.parquet
+#
+# Note: Files are automatically tracked via _file_index column (no preprocessing needed).
 # Note: Smaller datasets will be over-sampled (with replacement) to meet the ratio.
 dataset_ratios: null
 

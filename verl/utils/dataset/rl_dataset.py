@@ -279,6 +279,12 @@ class RLHFDataset(Dataset):
             # read parquet files and cache
             dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
 
+            # Add file tracking columns for WeightedDatasetSampler
+            dataframe = dataframe.add_column("_file_index", [i] * len(dataframe))
+            dataframe = dataframe.add_column("_source_file", [parquet_file] * len(dataframe))
+
+            logger.info(f"Loaded file {i}: {parquet_file} ({len(dataframe)} samples)")
+
             # Establish reference schema from first dataset
             if i == 0:
                 reference_features = dataframe.features
