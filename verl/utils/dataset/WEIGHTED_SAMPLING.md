@@ -294,10 +294,172 @@ Your ratios don't sum to exactly 1.0. They will be automatically normalized. To 
 
 This is expected for small datasets with high ratios. The dataset is over-sampled with replacement to meet the specified ratio.
 
+---
+
+## Schema Normalization
+
+### Overview
+
+When loading multiple datasets, you may encounter schema mismatch errors such as:
+- Missing fields in some datasets
+- Type mismatches between datasets
+- Null-type inference issues (when a column contains only null values)
+- Field ordering differences in struct types
+
+VERL provides automatic schema normalization to handle these cases.
+
+### Enabling Schema Normalization
+
+```yaml
+data:
+  train_files:
+    - dataset1.parquet
+    - dataset2.parquet
+  normalize_schema: true  # Enable schema normalization
+  schema_default_values:  # Default values for missing fields
+    dict: {}
+    list: []
+    str: ''
+    int: 0
+    float: 0.0
+    bool: false
+```
+
+### How It Works
+
+1. **Reference Schema**: The first dataset's schema is used as the reference
+2. **Missing Fields**: Fields present in the reference but missing in other datasets are added with default values
+3. **Type Casting**: All datasets are cast to match the reference schema (strict mode)
+4. **Extra Fields**: Fields in subsequent datasets that aren't in the reference are preserved
+5. **Error Handling**: Clear error messages if type casting fails
+
+### Configuration Options
+
+#### `normalize_schema` (boolean)
+
+- **Default**: `false`
+- **Description**: Enable/disable automatic schema normalization
+- **When to use**: When working with datasets that have slight schema differences
+
+#### `schema_default_values` (dict)
+
+- **Description**: Default values to use for missing fields based on type
+- **Default values**:
+  ```yaml
+  dict: {}
+  list: []
+  str: ''
+  int: 0
+  float: 0.0
+  bool: false
+  ```
+
+### Example Scenarios
+
+#### Scenario 1: Missing Field
+
+**Problem**:
+```
+Dataset 1: {prompt: str, data_source: str, extra_info: dict}
+Dataset 2: {prompt: str, data_source: str}  # Missing extra_info
+→ Error: Schema mismatch
+```
+
+**Solution**:
+```yaml
+data:
+  normalize_schema: true
+  schema_default_values:
+    dict: {}
+```
+
+**Result**: Dataset 2 gets `extra_info: {}` for all rows
+
+#### Scenario 2: Null-Type Inference
+
+**Problem**:
+```
+Dataset 1: {prompt: str, tags: list<string>}
+Dataset 2: {prompt: str, tags: null}  # All null values → inferred as "null" type
+→ Error: Type mismatch (list vs null)
+```
+
+**Solution**:
+```yaml
+data:
+  normalize_schema: true
+  schema_default_values:
+    list: []
+```
+
+**Result**: Dataset 2's `tags` field is cast to `list<string>` with empty lists
+
+#### Scenario 3: Type Mismatch (Incompatible)
+
+**Problem**:
+```
+Dataset 1: {prompt: str, value: str}
+Dataset 2: {prompt: str, value: int}
+→ Error: Cannot cast int to str
+```
+
+**Solution**: Preprocess datasets to align types before training, or keep `normalize_schema: false` and fix data manually.
+
+### When to Use Schema Normalization
+
+**Use it when:**
+- Datasets have optional fields that may be missing
+- Working with null-heavy datasets
+- Combining datasets from different sources with slight variations
+- You control the datasets and know types are compatible
+
+**Don't use it when:**
+- Datasets have fundamentally incompatible types
+- You want strict schema validation
+- Performance is critical (normalization adds slight overhead)
+- Schemas are already guaranteed to match
+
+### Best Practices
+
+1. **First Dataset Matters**: Ensure your first dataset has all required fields with correct types
+2. **Check Logs**: Schema normalization logs which fields are being added/modified
+3. **Test First**: Try with small samples to verify normalization works correctly
+4. **Set Appropriate Defaults**: Customize `schema_default_values` based on your data
+5. **Monitor Warnings**: Pay attention to logged warnings about schema differences
+
+### Error Messages
+
+#### "Schema normalization failed during casting"
+
+This means the type casting couldn't be performed. Common causes:
+- Incompatible types (e.g., string → int)
+- Nested struct differences
+- List element type mismatches
+
+**Solution**: Check the detailed error message to identify the problematic field and align types manually.
+
+#### "Missing fields in dataset: {...}"
+
+This is a warning (not an error) indicating which fields were added with default values.
+
+### Performance Considerations
+
+- Schema normalization adds overhead for each dataset after the first
+- For very large datasets, this may add 5-10% to loading time
+- Consider preprocessing datasets offline if loading time is critical
+
+---
+
 ## References
 
+### Weighted Dataset Sampling
 - Implementation: `verl/utils/dataset/weighted_sampler.py`
 - Integration: `verl/trainer/main_ppo.py` (see `create_rl_sampler()`)
 - Tests: `tests/utils/dataset/test_weighted_sampler_on_cpu.py`
 - Example: `examples/gpg_trainer/run_qwen2-7b_math_weighted.sh`
 - Config: `verl/trainer/config/data/legacy_data.yaml`
+
+### Schema Normalization
+- Implementation: `verl/utils/dataset/rl_dataset.py` (see `_normalize_schema()`, `_get_default_value()`)
+- Tests: `tests/utils/dataset/test_schema_normalization_on_cpu.py`
+- Config: `verl/trainer/config/data/legacy_data.yaml` (see `normalize_schema`, `schema_default_values`)

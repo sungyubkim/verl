@@ -28,6 +28,25 @@ dataset_ratios: null
 # Only relevant when dataset_ratios is set.
 epoch_size: null
 
+# Schema normalization (optional). Enable automatic schema normalization when loading multiple datasets.
+# This helps resolve schema mismatches such as:
+# - Missing fields in some datasets (filled with default values)
+# - Type mismatches (strict casting to first dataset's schema)
+# - Null-type inference issues (e.g., all-null columns)
+# If false, datasets must have compatible schemas or concatenation will fail.
+normalize_schema: false
+
+# Default values for missing fields when normalize_schema is enabled.
+# Maps field types to their default values.
+# These values are used when a field exists in the reference schema but is missing in other datasets.
+schema_default_values:
+  dict: {}
+  list: []
+  str: ''
+  int: 0
+  float: 0.0
+  bool: false
+
 # Maximum sample length to be used.
 # Set to -1 to use full dataset, otherwise, randomly
 # select the specified number of samples from train dataset

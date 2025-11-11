@@ -149,12 +149,150 @@ class RLHFDataset(Dataset):
         for i, parquet_file in enumerate(data_files):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
 
+    def _get_default_value(self, field_type):
+        """
+        Get default value for a given field type based on schema_default_values config.
+
+        Args:
+            field_type: datasets.Features type object
+
+        Returns:
+            Default value appropriate for the field type
+        """
+        # Get default values from config
+        default_values = self.config.get('schema_default_values', {
+            'dict': {},
+            'list': [],
+            'str': '',
+            'int': 0,
+            'float': 0.0,
+            'bool': False
+        })
+
+        # Convert field_type to string for analysis
+        type_str = str(field_type).lower()
+
+        # Determine default value based on type
+        if 'struct' in type_str or 'dict' in type_str:
+            return default_values.get('dict', {})
+        elif 'list' in type_str or 'sequence' in type_str or 'array' in type_str:
+            return default_values.get('list', [])
+        elif 'string' in type_str or 'str' in type_str:
+            return default_values.get('str', '')
+        elif 'int' in type_str:
+            return default_values.get('int', 0)
+        elif 'float' in type_str or 'double' in type_str:
+            return default_values.get('float', 0.0)
+        elif 'bool' in type_str:
+            return default_values.get('bool', False)
+        else:
+            # Default to None for unknown types
+            return None
+
+    def _normalize_schema(self, dataframe: datasets.Dataset, reference_features: datasets.Features) -> datasets.Dataset:
+        """
+        Normalize dataset schema to match reference schema.
+
+        This method:
+        1. Adds missing fields with default values
+        2. Casts types to match reference schema (strict)
+        3. Raises error if casting fails
+
+        Args:
+            dataframe: Dataset to normalize
+            reference_features: Reference schema (from first dataset)
+
+        Returns:
+            Normalized dataset with schema matching reference
+
+        Raises:
+            ValueError: If schema normalization fails
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        current_features = dataframe.features
+        missing_fields = set(reference_features.keys()) - set(current_features.keys())
+        extra_fields = set(current_features.keys()) - set(reference_features.keys())
+
+        # Log schema differences
+        if missing_fields:
+            logger.warning(f"Missing fields in dataset: {missing_fields}. Will add with default values.")
+        if extra_fields:
+            logger.info(f"Extra fields in dataset: {extra_fields}. These will be preserved.")
+
+        # Step 1: Add missing fields with default values
+        if missing_fields:
+            for field_name in sorted(missing_fields):  # Sort for deterministic order
+                field_type = reference_features[field_name]
+                default_value = self._get_default_value(field_type)
+
+                logger.info(f"Adding missing field '{field_name}' with type {field_type} and default value: {default_value}")
+
+                # Add column with default values
+                dataframe = dataframe.add_column(
+                    field_name,
+                    [default_value] * len(dataframe)
+                )
+
+        # Step 2: Cast to reference schema (strict)
+        try:
+            # Create features dict that includes both reference and extra fields
+            # This allows keeping extra fields while ensuring reference fields match
+            target_features = dict(reference_features)
+            for field_name in extra_fields:
+                target_features[field_name] = current_features[field_name]
+
+            dataframe = dataframe.cast(datasets.Features(target_features))
+            logger.info("Schema normalization successful")
+
+        except Exception as e:
+            # Provide detailed error message
+            error_msg = (
+                f"Schema normalization failed during casting.\n"
+                f"Reference schema: {reference_features}\n"
+                f"Current schema: {current_features}\n"
+                f"Error: {str(e)}\n\n"
+                f"This typically happens when:\n"
+                f"1. Field types are incompatible (e.g., trying to cast string to int)\n"
+                f"2. Struct fields have different nested schemas\n"
+                f"3. List element types differ\n\n"
+                f"Solutions:\n"
+                f"- Ensure all datasets have compatible field types\n"
+                f"- Preprocess datasets to align schemas before training\n"
+                f"- Set normalize_schema: false if schemas are already compatible"
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg) from e
+
+        return dataframe
+
     def _read_files_and_tokenize(self):
+        import logging
+        logger = logging.getLogger(__name__)
+
         dataframes = []
-        for parquet_file in self.data_files:
+        reference_features = None
+        normalize = self.config.get('normalize_schema', False)
+
+        for i, parquet_file in enumerate(self.data_files):
             # read parquet files and cache
             dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+
+            # Establish reference schema from first dataset
+            if i == 0:
+                reference_features = dataframe.features
+                if normalize and len(self.data_files) > 1:
+                    logger.info(f"Schema normalization enabled. Using schema from first dataset as reference:")
+                    logger.info(f"Reference file: {parquet_file}")
+                    logger.info(f"Reference schema: {reference_features}")
+            # Normalize subsequent datasets if enabled
+            elif normalize:
+                logger.info(f"Normalizing schema for: {parquet_file}")
+                dataframe = self._normalize_schema(dataframe, reference_features)
+
             dataframes.append(dataframe)
+
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         total = len(self.dataframe)
