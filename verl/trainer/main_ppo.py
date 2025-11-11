@@ -404,6 +404,7 @@ def create_rl_sampler(data_config, dataset):
     import torch
     from torch.utils.data import RandomSampler, SequentialSampler
 
+    # Priority 1: Explicitly specified custom sampler
     if data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
         curriculum_class = load_extern_type(
             data_config.sampler.class_path,
@@ -420,6 +421,22 @@ def create_rl_sampler(data_config, dataset):
             "curriculum sampler won't have the opportunity to reorder it. "
         )
 
+    # Priority 2: Automatic WeightedDatasetSampler if dataset_ratios is specified
+    elif data_config.get("dataset_ratios", None) is not None:
+        from verl.utils.dataset.weighted_sampler import WeightedDatasetSampler
+
+        sampler = WeightedDatasetSampler(
+            data_source=dataset,
+            data_config=data_config,
+        )
+        # WeightedDatasetSampler also requires num_workers=0 for consistent sampling
+        assert data_config.get("dataloader_num_workers", 8) == 0, (
+            "If using dataset_ratios with WeightedDatasetSampler, num_workers must be 0 "
+            "to prevent data caching and ensure consistent sampling ratios. "
+            "Set dataloader_num_workers: 0 in your config."
+        )
+
+    # Priority 3: Default samplers based on shuffle setting
     # Use a sampler to facilitate checkpoint resumption.
     # If shuffling is enabled in the data configuration, create a random sampler.
     elif data_config.shuffle:

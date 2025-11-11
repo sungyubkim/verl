@@ -13,6 +13,21 @@ train_files: ~/data/rlhf/gsm8k/train.parquet
 # Validation parquet. Can be a list or a single file.
 val_files: ~/data/rlhf/gsm8k/test.parquet
 
+# Dataset mixing ratios (optional). Only used when train_files contains multiple datasets.
+# Specifies the proportion of samples to draw from each dataset per epoch.
+# Must be a list of floats that sum to approximately 1.0.
+# Order corresponds to the order of datasets in train_files.
+# If null, all datasets are simply concatenated without ratio control (default behavior).
+# Example: [0.7, 0.3] means 70% from first dataset, 30% from second dataset.
+# Note: Smaller datasets will be over-sampled (with replacement) to meet the ratio.
+dataset_ratios: null
+
+# Epoch size (optional). Total number of samples to use per epoch when using dataset_ratios.
+# If null, automatically uses the size of the largest dataset.
+# If specified, must be a positive integer.
+# Only relevant when dataset_ratios is set.
+epoch_size: null
+
 # Maximum sample length to be used.
 # Set to -1 to use full dataset, otherwise, randomly
 # select the specified number of samples from train dataset

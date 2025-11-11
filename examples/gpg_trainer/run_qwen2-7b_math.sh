@@ -11,10 +11,20 @@ math_test_path=$HOME/data/math/test.parquet
 train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"
 
+# Optional: Control the mixing ratio of multiple datasets
+# Uncomment the following lines to use weighted dataset sampling:
+# - dataset_ratios: proportion of samples from each dataset (must sum to ~1.0)
+# - epoch_size: total samples per epoch (default: size of largest dataset)
+# - dataloader_num_workers: must be 0 when using dataset_ratios
+# Example: Sample 70% from GSM8K, 30% from MATH
+# dataset_ratios="[0.7, 0.3]"
+# epoch_size=null  # or specify a number like 8000
+
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gpg \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
+    data.dataloader_num_workers=8 \
     data.train_batch_size=1024 \
     data.max_prompt_length=1024 \
     data.max_response_length=1024 \
