@@ -361,6 +361,13 @@ def remove_left_padding(
         sp_world_size = mpu.get_tensor_model_parallel_world_size()
         pad_size = (sp_world_size - seq_len % sp_world_size) % sp_world_size
         seq_len = seq_len + pad_size
+    else:
+        # Pad to multiple of 64 for cuDNN FusedAttention kernel alignment
+        # Reference: https://docs.nvidia.com/deeplearning/cudnn/frontend/v1.9.0/operations/Attention.html
+        # All FusedAttention backends require seq_len % 64 == 0
+        alignment = 64
+        pad_size = (alignment - seq_len % alignment) % alignment
+        seq_len = seq_len + pad_size
     shape[1] = seq_len
     if pre_process:
         new_input_ids = torch.zeros(dtype=input_ids.dtype, device=input_ids.device, size=shape)
