@@ -170,6 +170,21 @@ class McoreModuleWrapperConfig:
     use_distributed_optimizer: bool = True
 
 
+def _update_attn_mask_type(model, attn_mask_type):
+    """Update attn_mask_type for all attention layers in the model.
+
+    This is needed because the layer spec in Megatron-Core hardcodes attn_mask_type=causal,
+    and when using mbridge, we can't modify the layer spec before model creation.
+    """
+    from megatron.core.transformer.attention import Attention
+
+    model_list = model if isinstance(model, list) else [model]
+    for m in model_list:
+        for module in m.modules():
+            if isinstance(module, Attention):
+                module.attn_mask_type = attn_mask_type
+
+
 def make_megatron_module(
     wrap_config: McoreModuleWrapperConfig,
     tf_config: TransformerConfig,
@@ -183,6 +198,9 @@ def make_megatron_module(
 ):
     if override_model_config is None:
         override_model_config = {}
+
+    # Save original attn_mask_type before it might be overwritten by model config extraction
+    original_attn_mask_type = getattr(tf_config, "attn_mask_type", None)
 
     if bridge is not None:
         if provider is None:
@@ -295,6 +313,14 @@ def make_megatron_module(
             use_distributed_optimizer=wrap_config.use_distributed_optimizer,
             override_ddp_config=override_ddp_config,
         )
+
+    # Update attn_mask_type for all attention layers if set in TransformerConfig
+    # This is needed because layer spec hardcodes attn_mask_type=causal, and mbridge
+    # doesn't propagate the config value to layer spec
+    # Use original_attn_mask_type because tf_config might be replaced with model's config
+    if original_attn_mask_type is not None:
+        _update_attn_mask_type(model, original_attn_mask_type)
+
     return model, tf_config
 
 
