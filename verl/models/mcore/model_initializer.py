@@ -102,7 +102,13 @@ class DenseModel(BaseModelInitializer):
     def get_transformer_layer_spec(self, vp_stage=None):
         assert self.tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
-        return get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+        layer_spec = get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+        # Override attn_mask_type from TransformerConfig if set
+        # The default in layer spec is AttnMaskType.causal, but we need padding_causal for BSHD with padding
+        if hasattr(self.tfconfig, "attn_mask_type") and self.tfconfig.attn_mask_type is not None:
+            for spec in layer_spec.layer_specs:
+                spec.submodules.self_attention.params["attn_mask_type"] = self.tfconfig.attn_mask_type
+        return layer_spec
 
 
 class Qwen2MoEModel(BaseModelInitializer):
@@ -113,9 +119,14 @@ class Qwen2MoEModel(BaseModelInitializer):
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
         transformer_layer_spec = get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
 
-        # Patch layer spec for shared experts
+        # Patch layer spec for shared experts and attn_mask_type
         for i in range(len(transformer_layer_spec.layer_specs)):
             transformer_layer_spec.layer_specs[i].submodules.mlp.submodules.shared_experts.params["gate"] = True
+            # Override attn_mask_type from TransformerConfig if set
+            if hasattr(self.tfconfig, "attn_mask_type") and self.tfconfig.attn_mask_type is not None:
+                transformer_layer_spec.layer_specs[i].submodules.self_attention.params["attn_mask_type"] = (
+                    self.tfconfig.attn_mask_type
+                )
 
         return transformer_layer_spec
 
@@ -136,6 +147,10 @@ class MixtralModel(BaseModelInitializer):
         assert self.tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
         transformer_layer_spec = get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+        # Override attn_mask_type from TransformerConfig if set
+        if hasattr(self.tfconfig, "attn_mask_type") and self.tfconfig.attn_mask_type is not None:
+            for spec in transformer_layer_spec.layer_specs:
+                spec.submodules.self_attention.params["attn_mask_type"] = self.tfconfig.attn_mask_type
         return transformer_layer_spec
 
     def initialize(self, **kwargs):
@@ -154,6 +169,10 @@ class Qwen3MoEModel(BaseModelInitializer):
         assert self.tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
         transformer_layer_spec = get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+        # Override attn_mask_type from TransformerConfig if set
+        if hasattr(self.tfconfig, "attn_mask_type") and self.tfconfig.attn_mask_type is not None:
+            for spec in transformer_layer_spec.layer_specs:
+                spec.submodules.self_attention.params["attn_mask_type"] = self.tfconfig.attn_mask_type
         return transformer_layer_spec
 
     def initialize(self, **kwargs):
@@ -172,6 +191,10 @@ class DeepseekV3Model(BaseModelInitializer):
     def get_transformer_layer_spec(self, vp_stage=None):
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
         transformer_layer_spec = get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+        # Override attn_mask_type from TransformerConfig if set
+        if hasattr(self.tfconfig, "attn_mask_type") and self.tfconfig.attn_mask_type is not None:
+            for spec in transformer_layer_spec.layer_specs:
+                spec.submodules.self_attention.params["attn_mask_type"] = self.tfconfig.attn_mask_type
         return transformer_layer_spec
 
     def get_rope_scaling_args(self) -> dict:
@@ -209,6 +232,10 @@ class Qwen25VLModel(BaseModelInitializer):
     def get_transformer_layer_spec(self, vp_stage=None):
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
         transformer_layer_spec = get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+        # Override attn_mask_type from TransformerConfig if set
+        if hasattr(self.tfconfig, "attn_mask_type") and self.tfconfig.attn_mask_type is not None:
+            for spec in transformer_layer_spec.layer_specs:
+                spec.submodules.self_attention.params["attn_mask_type"] = self.tfconfig.attn_mask_type
         return transformer_layer_spec
 
     def initialize(
