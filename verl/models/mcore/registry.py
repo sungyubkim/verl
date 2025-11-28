@@ -232,13 +232,26 @@ def init_mcore_model(
     )
 
 
-def get_mcore_forward_fn(hf_config: PretrainedConfig) -> Callable:
+def get_mcore_forward_fn(hf_config: PretrainedConfig, use_sequence_packing: bool = True) -> Callable:
     """
     Get the forward function for given model architecture.
+
+    Args:
+        hf_config: HuggingFace model configuration.
+        use_sequence_packing: Whether to use sequence packing (THD format).
+            If True (default), uses packed sequences for efficient attention.
+            If False, uses standard BSHD format with attention masks.
+            Note: Context Parallelism and fused kernels require packing=True.
     """
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
     model = get_supported_model(hf_config.architectures[0])
-    return MODEL_FORWARD_REGISTRY[model]
+
+    # Determine if this is a vision model
+    vision_models = {SupportedModel.QWEN2_5_VL, SupportedModel.QWEN3_MOE_VL, SupportedModel.QWEN3_VL}
+    is_vision_model = model in vision_models
+
+    # Generate forward function with specified packing mode
+    return model_forward_gen(vision_model=is_vision_model, use_sequence_packing=use_sequence_packing)
 
 
 def get_mcore_forward_no_padding_fn(hf_config: PretrainedConfig) -> Callable:

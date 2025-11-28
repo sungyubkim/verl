@@ -20,6 +20,7 @@ from verl.workers.config import (
     ActorConfig,
     FSDPActorConfig,
     McoreActorConfig,
+    McoreEngineConfig,
     OptimizerConfig,
 )
 
@@ -250,6 +251,65 @@ class TestActorConfig(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             config.validate(n_gpus=16, train_batch_size=512)
         self.assertIn("must be >= n_gpus", str(cm.exception))
+
+    def test_use_sequence_packing_default_value(self):
+        """Test that use_sequence_packing defaults to True."""
+        optim = OptimizerConfig(lr=0.1)
+        config = ActorConfig(
+            strategy="fsdp",
+            use_dynamic_bsz=True,
+            optim=optim,
+            rollout_n=1,
+        )
+        self.assertTrue(config.use_sequence_packing)
+
+    def test_mcore_actor_config_sequence_packing_with_fused_kernels_raises(self):
+        """Test that McoreActorConfig raises error when use_sequence_packing=False with use_fused_kernels=True."""
+        optim = OptimizerConfig(lr=0.1)
+        with self.assertRaises(ValueError) as cm:
+            McoreActorConfig(
+                strategy="megatron",
+                use_sequence_packing=False,
+                use_fused_kernels=True,
+                use_dynamic_bsz=True,
+                optim=optim,
+                rollout_n=1,
+            )
+        self.assertIn("Fused kernels require sequence packing", str(cm.exception))
+
+    def test_mcore_actor_config_sequence_packing_with_context_parallelism_raises(self):
+        """Test that McoreActorConfig raises error when use_sequence_packing=False with context_parallel_size>1."""
+        optim = OptimizerConfig(lr=0.1)
+        megatron_config = McoreEngineConfig(context_parallel_size=2)
+        with self.assertRaises(ValueError) as cm:
+            McoreActorConfig(
+                strategy="megatron",
+                use_sequence_packing=False,
+                use_fused_kernels=False,
+                megatron=megatron_config,
+                use_dynamic_bsz=True,
+                optim=optim,
+                rollout_n=1,
+            )
+        self.assertIn("Context Parallelism", str(cm.exception))
+        self.assertIn("requires sequence packing", str(cm.exception))
+
+    def test_mcore_actor_config_sequence_packing_valid_config(self):
+        """Test that McoreActorConfig allows use_sequence_packing=False with valid settings."""
+        optim = OptimizerConfig(lr=0.1)
+        megatron_config = McoreEngineConfig(context_parallel_size=1)
+        # This should not raise an error
+        config = McoreActorConfig(
+            strategy="megatron",
+            use_sequence_packing=False,
+            use_fused_kernels=False,
+            megatron=megatron_config,
+            use_dynamic_bsz=True,
+            optim=optim,
+            rollout_n=1,
+        )
+        self.assertFalse(config.use_sequence_packing)
+        self.assertFalse(config.use_fused_kernels)
 
 
 if __name__ == "__main__":

@@ -22,10 +22,12 @@ from .util import (
     postprocess_packed_seqs_no_padding,
     preprocess_packed_seqs,
     preprocess_packed_seqs_no_padding,
+    recover_left_padding,
+    remove_left_padding,
 )
 
 
-def model_forward_gen(vision_model: bool = False):
+def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = True):
     def model_forward(
         model,
         input_ids,
@@ -36,13 +38,16 @@ def model_forward_gen(vision_model: bool = False):
         logits_processor_args: dict = None,
         value_model=False,
     ):
-        """Forward pass for models with sequence packing."""
+        """Forward pass for models with optional sequence packing.
+
+        Args:
+            use_sequence_packing: If True, uses THD format with packed sequences.
+                If False, uses standard BSHD format with attention masks.
+        """
         pre_process = (
             unwrap_model(model).pre_process if not vision_model else False
         )  # vision model does not need pre_process, because we pack the input_ids to thd in the forward function
         post_process = unwrap_model(model).post_process
-        fp8 = unwrap_model(model).config.fp8
-        use_fp8_padding = fp8 in ["e4m3", "hybrid"]
 
         model_kwargs = {}
         if "pixel_values" in multi_modal_inputs:
@@ -55,44 +60,86 @@ def model_forward_gen(vision_model: bool = False):
             model_kwargs["video_grid_thw"] = multi_modal_inputs["video_grid_thw"].to(input_ids.device)
 
         batch_size, seq_len = attention_mask.shape[:2]
-        input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
-            input_ids, attention_mask, pre_process=pre_process, use_fp8_padding=use_fp8_padding
-        )
-        input_ids_rmpad = input_ids_rmpad.contiguous()
 
-        input_args = dict(
-            input_ids=input_ids_rmpad,
-            attention_mask=None,
-            position_ids=position_ids if not vision_model else None,  # vision models will calculate position_ids
-            packed_seq_params=packed_seq_params,
-            **model_kwargs,
-        )
+        if use_sequence_packing:
+            # Sequence packing path (THD format)
+            fp8 = unwrap_model(model).config.fp8
+            use_fp8_padding = fp8 in ["e4m3", "hybrid"]
 
-        if vision_model:
-            # workaround for supporting sequence packing with context parallelism
-            # cp split with sequence packing will make model lose vision token information, so we need to keep
-            # the original input_ids and pack them after vision embedding is calculated,
-            # cooporate with mbridge
-            input_args["input_ids"] = input_ids
-            input_args["attention_mask"] = attention_mask
-
-        output_orig = model(**input_args)
-        if post_process and logits_processor is not None:
-            args = {
-                k: preprocess_packed_seqs(v, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding)[0]
-                for k, v in logits_processor_args.items()
-            }
-            output_dict = logits_processor(output_orig, **args)
-            output = {
-                k: postprocess_packed_seqs(
-                    v, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
-                )
-                for k, v in output_dict.items()
-            }
-        else:
-            output = postprocess_packed_seqs(
-                output_orig, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+            input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
+                input_ids, attention_mask, pre_process=pre_process, use_fp8_padding=use_fp8_padding
             )
+            input_ids_rmpad = input_ids_rmpad.contiguous()
+
+            input_args = dict(
+                input_ids=input_ids_rmpad,
+                attention_mask=None,
+                position_ids=position_ids if not vision_model else None,
+                packed_seq_params=packed_seq_params,
+                **model_kwargs,
+            )
+
+            if vision_model:
+                # workaround for supporting sequence packing with context parallelism
+                # cp split with sequence packing will make model lose vision token information, so we need to keep
+                # the original input_ids and pack them after vision embedding is calculated,
+                # cooporate with mbridge
+                input_args["input_ids"] = input_ids
+                input_args["attention_mask"] = attention_mask
+
+            output_orig = model(**input_args)
+            if post_process and logits_processor is not None:
+                args = {
+                    k: preprocess_packed_seqs(v, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding)[0]
+                    for k, v in logits_processor_args.items()
+                }
+                output_dict = logits_processor(output_orig, **args)
+                output = {
+                    k: postprocess_packed_seqs(
+                        v, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+                    )
+                    for k, v in output_dict.items()
+                }
+            else:
+                output = postprocess_packed_seqs(
+                    output_orig, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+                )
+        else:
+            # Non-packing path (standard BSHD format with attention masks)
+            # This path is for models that require features incompatible with THD format
+            # (e.g., learnable softmax in TransformerEngine)
+            sequence_parallel = unwrap_model(model).config.sequence_parallel
+
+            # Remove left padding and convert to right-padded format
+            new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
+                input_ids,
+                attention_mask,
+                position_ids,
+                sequence_parallel=sequence_parallel,
+                pre_process=pre_process,
+            )
+
+            input_args = dict(
+                input_ids=new_input_ids,
+                attention_mask=new_attention_mask,  # Pass attention mask (not None)
+                position_ids=new_position_ids if not vision_model else None,
+                packed_seq_params=None,  # No sequence packing
+                **model_kwargs,
+            )
+
+            output_orig = model(**input_args)
+            if post_process and logits_processor is not None:
+                # For non-packing path, logits_processor_args don't need packing preprocessing
+                output_dict = logits_processor(output_orig, **logits_processor_args)
+                output = {
+                    k: recover_left_padding(v, new_attention_mask, attention_mask, seq_len, post_process=post_process)
+                    for k, v in output_dict.items()
+                }
+            else:
+                output = recover_left_padding(
+                    output_orig, new_attention_mask, attention_mask, seq_len, post_process=post_process
+                )
+
         if value_model and post_process:
             output = output[..., 0]
         return output

@@ -120,6 +120,7 @@ class ActorConfig(BaseConfig):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
+    use_sequence_packing: bool = True  # Whether to use sequence packing (THD format) for Megatron training
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
     rollout_n: int = MISSING  # must be override by sampling config
@@ -215,9 +216,25 @@ class McoreActorConfig(ActorConfig):
     use_rollout_log_probs: bool = False
 
     def __post_init__(self):
-        """Validate FSDP actor configuration parameters."""
+        """Validate Megatron actor configuration parameters."""
         super().__post_init__()
         self.engine = self.megatron
+
+        # Validate sequence packing constraints
+        if not self.use_sequence_packing:
+            # Fused kernels require sequence packing
+            if self.use_fused_kernels:
+                raise ValueError(
+                    "Fused kernels require sequence packing. "
+                    "Set use_sequence_packing=True or use_fused_kernels=False."
+                )
+            # Context Parallelism requires sequence packing
+            cp_size = getattr(self.megatron, "context_parallel_size", 1)
+            if cp_size > 1:
+                raise ValueError(
+                    f"Context Parallelism (context_parallel_size={cp_size}) requires sequence packing. "
+                    f"Set use_sequence_packing=True or context_parallel_size=1."
+                )
 
 
 @dataclass

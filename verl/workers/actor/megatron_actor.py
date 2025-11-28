@@ -130,6 +130,7 @@ class MegatronPPOActor(BasePPOActor):
         else:
             self.prof = None
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
+        self.use_sequence_packing = self.config.get("use_sequence_packing", True)
         if self.use_fused_kernels and not getattr(self.config, "overlap_moe_expert_parallel_comm", False):
             # do not patch if overlap_moe_expert_parallel_comm is enabled
             from verl.models.mcore.model_forward_fused import patch_fused_forward
@@ -569,7 +570,7 @@ class MegatronPPOActor(BasePPOActor):
                     multi_modal_inputs=multi_modal_inputs,
                 )
             else:
-                forward_fn = get_mcore_forward_fn(self.hf_config)
+                forward_fn = get_mcore_forward_fn(self.hf_config, use_sequence_packing=self.use_sequence_packing)
 
                 def logits_processor(logits, label, label_mask):
                     assert logits.shape[:2] == label.shape[:2]
