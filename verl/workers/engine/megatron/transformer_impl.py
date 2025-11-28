@@ -595,6 +595,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         batch = batch.to(get_device_id())
         batch = batch.contiguous()
         input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
         loss_mask = batch["loss_mask"].to(bool)
         position_ids = batch["position_ids"]
 
@@ -620,6 +621,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         return {
             "input_ids": input_ids,
+            "attention_mask": attention_mask,
             "loss_mask": loss_mask,
             "position_ids": position_ids,
             "multi_modal_inputs": multi_modal_inputs,
@@ -646,6 +648,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         model_inputs = self.prepare_model_inputs(batch)
         input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        position_ids = model_inputs["position_ids"]
         multi_modal_inputs = model_inputs["multi_modal_inputs"]
 
         if pad_mode == DatasetPadMode.NO_PADDING:
@@ -653,12 +657,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
         else:
             raise NotImplementedError(f"Pad mode {pad_mode} is not supported for megatron engine")
 
-        from verl.models.mcore import get_mcore_forward_no_padding_fn
+        from verl.models.mcore import get_mcore_forward_fn
 
         if use_fused_kernels:
             raise NotImplementedError("Fused kernels are not supported for megatron engine")
 
-        forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
+        forward_fn = get_mcore_forward_fn(
+            self.model_config.hf_config,
+            use_sequence_packing=self.engine_config.use_sequence_packing
+        )
 
         def logits_processor(logits, label):
             assert logits.shape[:2] == label.shape[:2]
@@ -686,6 +693,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
         output = forward_fn(
             model,
             input_ids,
+            attention_mask,
+            position_ids,
             multi_modal_inputs,
             logits_processor=logits_processor,
             logits_processor_args=logits_processor_args,
