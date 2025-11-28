@@ -346,8 +346,13 @@ def remove_left_padding(
     pre_process: bool = True,
 ):
     """
-    Remove left padding from input_ids, attention_mask and position_ids
-    return new_input_ids, new_attention_mask, new_position_ids
+    Remove left padding from input_ids, attention_mask and position_ids.
+
+    Returns:
+        new_input_ids: Right-padded input_ids
+        new_attention_mask: 4D attention mask [batch_size, 1, 1, seq_len] for
+            TransformerEngine FusedAttention compatibility with BSHD format
+        new_position_ids: Right-padded position_ids
     """
     assert attention_mask.ndim == 2
     assert position_ids.ndim == 2
@@ -371,15 +376,20 @@ def remove_left_padding(
     shape[1] = seq_len
     if pre_process:
         new_input_ids = torch.zeros(dtype=input_ids.dtype, device=input_ids.device, size=shape)
-    new_attention_mask = torch.zeros(
+    # Create 2D mask first, then convert to 4D for FusedAttention
+    new_attention_mask_2d = torch.zeros(
         dtype=attention_mask.dtype, device=attention_mask.device, size=(batch_size, seq_len)
     )
     new_position_ids = torch.zeros(dtype=position_ids.dtype, device=position_ids.device, size=(batch_size, seq_len))
     for i in range(batch_size):
         if pre_process:
             new_input_ids[i, : seq_lens[i]] = input_ids[i, attention_mask[i]]
-        new_attention_mask[i, : seq_lens[i]] = attention_mask[i, attention_mask[i]]
+        new_attention_mask_2d[i, : seq_lens[i]] = attention_mask[i, attention_mask[i]]
         new_position_ids[i, : seq_lens[i]] = position_ids[i, attention_mask[i]]
+
+    # Convert to 4D [batch_size, 1, 1, seq_len] for TransformerEngine FusedAttention BSHD compatibility
+    new_attention_mask = new_attention_mask_2d.unsqueeze(1).unsqueeze(1)
+
     if pre_process:
         return new_input_ids, new_attention_mask, new_position_ids
     else:
