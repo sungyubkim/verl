@@ -736,15 +736,22 @@ class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
         batch = batch.to(get_device_id())
         model_inputs = self.prepare_model_inputs(batch)
         input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        position_ids = model_inputs["position_ids"]
         multi_modal_inputs = model_inputs["multi_modal_inputs"]
 
-        from verl.models.mcore import get_mcore_forward_no_padding_fn
+        from verl.models.mcore import get_mcore_forward_fn
 
-        forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
+        forward_fn = get_mcore_forward_fn(
+            self.model_config.hf_config,
+            use_sequence_packing=self.engine_config.use_sequence_packing
+        )
 
         output = forward_fn(
             model,
             input_ids,
+            attention_mask,
+            position_ids,
             multi_modal_inputs,
             value_model=True,
         )
