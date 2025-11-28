@@ -474,6 +474,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # Convert megatron lora config to HFModelConfig
         model_config_dict = OmegaConf.to_container(self.config.model)
         model_config_dict.pop("lora", None)
+        # Remove actor-specific fields that may have been interpolated into model config
+        model_config_dict.pop("use_sequence_packing", None)
 
         model_config: HFModelConfig = omega_conf_to_dataclass(
             OmegaConf.create(model_config_dict), dataclass_type=HFModelConfig
