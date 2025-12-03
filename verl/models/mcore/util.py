@@ -409,6 +409,11 @@ def recover_left_padding(
     """
     if not post_process:
         return result
+
+    # Handle 4D attention mask from remove_left_padding [batch, 1, 1, seq_len] -> [batch, seq_len]
+    if attention_mask.ndim == 4:
+        attention_mask = attention_mask.squeeze(1).squeeze(1)
+
     shape = list(result.shape)
     batch_size = shape[0]
     shape[1] = origin_seqlen
