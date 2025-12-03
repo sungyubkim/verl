@@ -129,8 +129,20 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
             output_orig = model(**input_args)
             if post_process and logits_processor is not None:
-                # For non-packing path, logits_processor_args don't need packing preprocessing
-                output_dict = logits_processor(output_orig, **logits_processor_args)
+                # For non-packing path, convert logits_processor_args to right-padded format
+                # to match output_orig shape (which was processed by remove_left_padding)
+                args = {}
+                for k, v in logits_processor_args.items():
+                    # Use remove_left_padding for 2D tensors by adding/removing a dimension
+                    converted, _, _ = remove_left_padding(
+                        v.unsqueeze(-1),  # [batch, seq_len] -> [batch, seq_len, 1]
+                        attention_mask,
+                        position_ids,
+                        sequence_parallel=sequence_parallel,
+                        pre_process=True,
+                    )
+                    args[k] = converted.squeeze(-1)  # [batch, new_seq_len, 1] -> [batch, new_seq_len]
+                output_dict = logits_processor(output_orig, **args)
                 output = {
                     k: recover_left_padding(v, new_attention_mask, attention_mask, seq_len, post_process=post_process)
                     for k, v in output_dict.items()
