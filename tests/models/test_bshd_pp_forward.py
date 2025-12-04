@@ -66,7 +66,7 @@ os.environ["NCCL_DEBUG"] = "WARN"
 
 import torch
 import torch.distributed as dist
-from transformers import AutoModelForCausalLM, Qwen3Config
+from transformers import AutoModelForCausalLM, Qwen2MoeConfig, Qwen3Config
 
 
 def create_test_model(tmp_dir: str) -> str:
@@ -81,6 +81,31 @@ def create_test_model(tmp_dir: str) -> str:
     )
     model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
     path = os.path.join(tmp_dir, "test_model")
+    model.save_pretrained(path)
+    config.save_pretrained(path)
+    return path
+
+
+def create_test_moe_model(tmp_dir: str) -> str:
+    """Create a small MoE test model for 1F1B overlap testing.
+
+    This model has Mixture of Experts (MoE) architecture which is required
+    for build_schedule_plan to be available in Megatron-Core.
+    """
+    config = Qwen2MoeConfig(
+        num_hidden_layers=4,  # Small model for testing
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=256,  # Size of each expert
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=1000,
+        num_experts=4,  # Number of experts
+        num_experts_per_tok=2,  # Top-k experts per token
+        shared_expert_intermediate_size=256,
+    )
+    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
+    path = os.path.join(tmp_dir, "test_moe_model")
     model.save_pretrained(path)
     config.save_pretrained(path)
     return path
@@ -726,11 +751,12 @@ def test_bshd_1f1b_overlap(
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
-    # Create test model (only on rank 0)
+    # Create MoE test model (only on rank 0)
+    # MoE model is required for build_schedule_plan to be available
     tmp_dir = tempfile.mkdtemp(prefix="verl_test_bshd_1f1b_")
     if rank == 0:
-        model_path = create_test_model(tmp_dir)
-        print(f"[Rank {rank}] Created test model at: {model_path}")
+        model_path = create_test_moe_model(tmp_dir)
+        print(f"[Rank {rank}] Created MoE test model at: {model_path}")
     else:
         model_path = ""
 
@@ -771,7 +797,10 @@ def test_bshd_1f1b_overlap(
 
     if not has_schedule_plan:
         print(f"[Rank {rank}] ⚠ Skipping 1F1B overlap test: model does not support build_schedule_plan")
-        print(f"[Rank {rank}]   This may require a newer version of Megatron-Core or specific model configuration")
+        print(f"[Rank {rank}]   Requirements for build_schedule_plan:")
+        print(f"[Rank {rank}]   - Megatron-Core version >= 0.13.0 with overlap support")
+        print(f"[Rank {rank}]   - MoE model with overlap_moe_expert_parallel_comm=True")
+        print(f"[Rank {rank}]   - TransformerConfig with schedule plan enabled")
         dist.barrier()
         mpu.destroy_model_parallel()
         dist.destroy_process_group()

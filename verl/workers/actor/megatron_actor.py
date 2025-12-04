@@ -526,9 +526,11 @@ class MegatronPPOActor(BasePPOActor):
                 from megatron.core.models.gpt.gpt_model import GPTModel
 
                 assert isinstance(model, GPTModel), "model must be a GPTModel"
-                assert self.use_fused_kernels, "use_fused_kernels must be enabled to return the schedule plan"
+                # Note: use_fused_kernels is no longer required for 1F1B overlap
+                # BSHD path (use_fused_kernels=False) also supports 1F1B overlap via gptmodel_forward_1f1b_overlap_bshd
                 # TODO: support VLM with MoE
-                from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap
+                if self.use_fused_kernels:
+                    from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap
 
             batch = next(batch_iter)
             batch = batch.to(get_device_id())
