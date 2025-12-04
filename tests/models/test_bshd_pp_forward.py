@@ -765,6 +765,8 @@ def test_bshd_1f1b_overlap(
     dist.barrier()
 
     # Configure engine with PP
+    # Note: overlap_moe_expert_parallel_comm=True is required for build_schedule_plan
+    # to be available on the Megatron-Core GPTModel
     model_config = HFModelConfig(path=model_path, load_tokenizer=False)
     engine_config = McoreEngineConfig(
         forward_only=True,
@@ -773,6 +775,7 @@ def test_bshd_1f1b_overlap(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=cp_size,
+        override_transformer_config={"overlap_moe_expert_parallel_comm": True},
     )
     optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
     checkpoint_config = CheckpointConfig()
