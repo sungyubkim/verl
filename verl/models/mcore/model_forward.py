@@ -15,6 +15,8 @@
 # limitations under the License.
 
 
+import torch
+
 from verl.utils.megatron_utils import unwrap_model
 
 from .util import (
@@ -131,6 +133,12 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
             if post_process and logits_processor is not None:
                 # For non-packing path, convert logits_processor_args to right-padded format
                 # to match output_orig shape (which was processed by remove_left_padding)
+                #
+                # NOTE: With PP>1 + CP>1, the model may output tensors with fixed shape
+                # (max_seq_len / CP) due to PP communication using fixed tensor shapes.
+                # We need to pad logits_processor_args to match output_orig.shape[1].
+                output_seq_len = output_orig.shape[1]
+
                 args = {}
                 for k, v in logits_processor_args.items():
                     # Use remove_left_padding for 2D tensors by adding/removing a dimension
@@ -141,7 +149,22 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                         sequence_parallel=sequence_parallel,
                         pre_process=True,
                     )
-                    args[k] = converted.squeeze(-1)  # [batch, new_seq_len, 1] -> [batch, new_seq_len]
+                    converted = converted.squeeze(-1)  # [batch, new_seq_len, 1] -> [batch, new_seq_len]
+
+                    # Pad to match output_orig.shape[1] if needed (PP fixed shape handling)
+                    if converted.shape[1] < output_seq_len:
+                        padding = torch.zeros(
+                            converted.shape[0],
+                            output_seq_len - converted.shape[1],
+                            dtype=converted.dtype,
+                            device=converted.device,
+                        )
+                        converted = torch.cat([converted, padding], dim=1)
+                    elif converted.shape[1] > output_seq_len:
+                        # Defensive: truncate if larger (should not happen normally)
+                        converted = converted[:, :output_seq_len]
+
+                    args[k] = converted
                 output_dict = logits_processor(output_orig, **args)
                 output = {
                     k: recover_left_padding(v, new_attention_mask, attention_mask, seq_len, post_process=post_process)
