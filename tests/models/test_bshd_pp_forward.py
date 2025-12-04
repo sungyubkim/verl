@@ -210,6 +210,8 @@ def test_bshd_pp_forward(
     batch = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
 
     # Import the BSHD forward function and PP utilities
+    from functools import partial
+
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap_bshd
@@ -228,12 +230,35 @@ def test_bshd_pp_forward(
         log_probs = log_probs.masked_fill(~label_mask, 0.0)
         return {"log_probs": log_probs}
 
+    # Define loss_func for forward_backward_func (required even for forward_only mode)
+    def loss_func(output, non_loss_data=False):
+        """Loss function for PP scheduling.
+
+        Megatron's forward_backward_func always calls loss_func, even in forward_only mode.
+        When collect_non_loss_data=True, it calls loss_func(output, non_loss_data=True)
+        and expects the output to be returned directly.
+
+        Args:
+            output: The output from forward step (schedule plan output)
+            non_loss_data: If True, return the output directly without computing loss
+
+        Returns:
+            If non_loss_data=True: the output dict directly
+            Otherwise: (dummy_loss, metrics) tuple
+        """
+        if non_loss_data:
+            return output
+        # Return (loss, metrics) tuple for non-forward_only mode
+        dummy_loss = torch.tensor(1.0, device="cuda")
+        metrics = {"output": output}
+        return dummy_loss, metrics
+
     # Define forward_step function for forward_backward_func
     def forward_step(batch_iter, model):
         """Forward step that returns (output, loss_func) tuple for PP scheduling.
 
         The forward_backward_func expects forward_step to return a tuple of (output, loss_func).
-        For forward_only=True, loss_func should be None.
+        loss_func must be a callable - it cannot be None even in forward_only mode.
         """
         micro_batch = next(batch_iter)
         output = gptmodel_forward_1f1b_overlap_bshd(
@@ -251,8 +276,8 @@ def test_bshd_pp_forward(
             },
             temperature=1.0,
         )
-        # Return (output, loss_func) tuple - loss_func=None for forward_only mode
-        return output, None
+        # Return (output, loss_func) tuple - loss_func must be callable, not None!
+        return output, partial(loss_func)
 
     # Run BSHD forward with PP using forward_backward_func
     try:
@@ -260,6 +285,7 @@ def test_bshd_pp_forward(
         batch_generator = make_batch_generator([batch], vpp_size=len(engine.module))
 
         # forward_backward_func executes the schedule plan and returns results
+        # collect_non_loss_data=True is required for forward_only mode to get output dict
         output = forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=batch_generator,
@@ -268,6 +294,7 @@ def test_bshd_pp_forward(
             seq_length=seqlen,
             micro_batch_size=batch_size,
             forward_only=True,
+            collect_non_loss_data=True,  # Required to get output dict in forward_only mode
         )
 
         # Check output on last PP stage
