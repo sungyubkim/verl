@@ -16,17 +16,15 @@
 Unit tests for BSHD (non-sequence-packing) format support.
 
 This test verifies that the BSHD format works correctly with Megatron models.
-The key function being tested is `gptmodel_forward_1f1b_overlap_bshd` which
-provides schedule plan generation for BSHD format.
-
-Note: The schedule plan returned by gptmodel_forward_1f1b_overlap_bshd is designed
-for the combined_1f1b scheduler (which requires overlap_moe_expert_parallel_comm=True
-and forward_only=False). For testing without MoE overlap, we use PP=1 to directly
-execute the forward pass and verify the BSHD conversion logic.
+The key function being tested is `model_forward_gen(use_sequence_packing=False)`
+which provides BSHD format support with Pipeline Parallelism.
 
 Run with:
     # 1 GPU - PP=1 (basic BSHD forward test)
     torchrun --nproc_per_node=1 tests/models/test_bshd_pp_forward.py --test basic
+
+    # 2 GPUs - PP=2 (BSHD with pipeline parallelism)
+    torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test pp_only
 
     # 2 GPUs - TP=2 (BSHD with tensor parallelism)
     torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test tp_only
@@ -38,7 +36,7 @@ Run with:
     torchrun --nproc_per_node=1 tests/models/test_bshd_pp_forward.py --test compare
 
 Options:
-    --test: Test configuration (basic, tp_only, cp_only, compare, actor)
+    --test: Test configuration (basic, pp_only, tp_only, cp_only, compare, actor)
     --bridge: Weight loading bridge to use
         - mbridge: Use mbridge package (vanilla_mbridge=True, default)
         - megatron: Use megatron.bridge (vanilla_mbridge=False)
@@ -270,6 +268,176 @@ def test_bshd_forward(
         raise
     except Exception as e:
         print(f"[Rank {rank}] ✗ ERROR: {type(e).__name__}: {e}")
+        raise
+
+    # Cleanup
+    dist.barrier()
+    mpu.destroy_model_parallel()
+    dist.destroy_process_group()
+
+    if rank == 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    print(f"[Rank {rank}] Test completed successfully!")
+
+
+def test_bshd_pp_forward(
+    tp_size: int = 1,
+    pp_size: int = 2,
+    cp_size: int = 1,
+    vanilla_mbridge: bool = True,
+):
+    """Test BSHD forward with Pipeline Parallelism.
+
+    This test verifies that:
+    1. The BSHD format (model_forward_gen with use_sequence_packing=False) works with PP
+    2. The forward_backward_func correctly schedules PP execution
+    3. The output log_probs have correct shape
+
+    Args:
+        tp_size: Tensor parallel size
+        pp_size: Pipeline parallel size
+        cp_size: Context parallel size
+        vanilla_mbridge: If True, use mbridge; if False, use megatron.bridge
+    """
+    import megatron.core.parallel_state as mpu
+    from functools import partial
+
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+
+    from verl.models.mcore import get_mcore_forward_fn
+    from verl.trainer.config import CheckpointConfig
+    from verl.utils.megatron.pipeline_parallel import make_batch_generator
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+    from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+    from verl.workers.engine import EngineRegistry
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    torch.cuda.set_device(local_rank)
+
+    # Initialize distributed
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    # Create test model (only on rank 0)
+    tmp_dir = tempfile.mkdtemp(prefix="verl_test_bshd_pp_")
+    if rank == 0:
+        model_path = create_test_model(tmp_dir)
+        print(f"[Rank {rank}] Created test model at: {model_path}")
+    else:
+        model_path = ""
+
+    dist.barrier()
+    model_path = broadcast_model_path(model_path if rank == 0 else "", rank)
+    dist.barrier()
+
+    # Configure engine with PP
+    model_config = HFModelConfig(path=model_path, load_tokenizer=False)
+    engine_config = McoreEngineConfig(
+        forward_only=True,
+        use_mbridge=True,
+        vanilla_mbridge=vanilla_mbridge,
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        context_parallel_size=cp_size,
+    )
+    optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
+    checkpoint_config = CheckpointConfig()
+
+    # Build engine
+    engine = EngineRegistry.new(
+        model_type="language_model",
+        backend="megatron",
+        model_config=model_config,
+        engine_config=engine_config,
+        optimizer_config=optimizer_config,
+        checkpoint_config=checkpoint_config,
+    )
+    engine.initialize()
+
+    # Create test batch
+    batch_size = 4
+    seqlen = 64
+    vocab_size = model_config.hf_config.vocab_size
+
+    batch = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
+
+    # Get BSHD forward function
+    bshd_forward = get_mcore_forward_fn(model_config.hf_config, use_sequence_packing=False)
+
+    # Define logits processor
+    def logits_processor(logits, label, label_mask):
+        assert logits.shape[:2] == label.shape[:2], (
+            f"Shape mismatch: logits {logits.shape[:2]} vs label {label.shape[:2]}"
+        )
+        log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+        log_probs = log_probs.masked_fill(~label_mask, 0.0)
+        return {"log_probs": log_probs}
+
+    # Define loss_func for forward_backward_func
+    def loss_func(output, non_loss_data=False):
+        if non_loss_data:
+            return output
+        dummy_loss = torch.tensor(1.0, device="cuda")
+        return dummy_loss, {"output": output}
+
+    # Define forward_step function for forward_backward_func
+    def forward_step(batch_iter, model):
+        micro_batch = next(batch_iter)
+        output = bshd_forward(
+            model=model,
+            input_ids=micro_batch["input_ids"],
+            attention_mask=micro_batch["attention_mask"],
+            position_ids=micro_batch["position_ids"],
+            multi_modal_inputs={},
+            logits_processor=logits_processor,
+            logits_processor_args={
+                "label": micro_batch["label"],
+                "label_mask": micro_batch["label_mask"],
+            },
+        )
+        return output, partial(loss_func)
+
+    # Run BSHD forward with PP
+    try:
+        forward_backward_func = get_forward_backward_func()
+        batch_generator = make_batch_generator([batch], vpp_size=len(engine.module))
+
+        output = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=batch_generator,
+            model=engine.module,
+            num_microbatches=1,
+            seq_length=seqlen,
+            micro_batch_size=batch_size,
+            forward_only=True,
+            collect_non_loss_data=True,
+        )
+
+        # Check output on last PP stage
+        if mpu.is_pipeline_last_stage():
+            assert output is not None, "Expected output on last PP stage"
+            # output is a list of (output_dict,) tuples from each microbatch
+            assert len(output) == 1, f"Expected 1 microbatch output, got {len(output)}"
+            output_dict = output[0]
+            if isinstance(output_dict, tuple):
+                output_dict = output_dict[0]
+            assert "log_probs" in output_dict, "Expected 'log_probs' in output"
+            log_probs = output_dict["log_probs"]
+            print(f"[Rank {rank}] ✓ PP forward passed! log_probs shape: {log_probs.shape}")
+        else:
+            print(f"[Rank {rank}] ✓ PP forward passed on non-last stage")
+
+    except AssertionError as e:
+        print(f"[Rank {rank}] ✗ FAILED: {e}")
+        raise
+    except Exception as e:
+        print(f"[Rank {rank}] ✗ ERROR: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
     # Cleanup
@@ -531,7 +699,7 @@ def main():
         "--test",
         type=str,
         default="basic",
-        choices=["basic", "tp_only", "cp_only", "compare", "actor"],
+        choices=["basic", "pp_only", "tp_only", "cp_only", "compare", "actor"],
         help="Test configuration to run",
     )
     parser.add_argument(
@@ -556,6 +724,12 @@ def main():
         # PP=1, TP=1, CP=1 (requires 1 GPU)
         # Basic BSHD forward test to verify remove_left_padding/recover_left_padding
         test_bshd_forward(tp_size=1, pp_size=1, cp_size=1, vanilla_mbridge=vanilla_mbridge)
+
+    elif args.test == "pp_only":
+        # PP=2, TP=1, CP=1 (requires 2 GPUs)
+        # Test BSHD with pipeline parallelism using forward_backward_func
+        assert world_size >= 2, f"Need at least 2 GPUs, got {world_size}"
+        test_bshd_pp_forward(tp_size=1, pp_size=2, cp_size=1, vanilla_mbridge=vanilla_mbridge)
 
     elif args.test == "tp_only":
         # PP=1, TP=2, CP=1 (requires 2 GPUs)

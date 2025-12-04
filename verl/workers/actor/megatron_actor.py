@@ -601,9 +601,8 @@ class MegatronPPOActor(BasePPOActor):
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
 
-                if pp_size > 1:
-                    # PP + non-fused: use BSHD 1F1B overlap forward
-                    # This is needed because model_forward_gen() doesn't handle PP scheduling
+                # THD pattern: use schedule_plan only when return_schedule_plan=True
+                if return_schedule_plan:
                     from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap_bshd
 
                     output = gptmodel_forward_1f1b_overlap_bshd(
@@ -619,7 +618,6 @@ class MegatronPPOActor(BasePPOActor):
                         temperature=temperature,
                     )
                 else:
-                    # Non-PP: use existing model_forward_gen
                     forward_fn = get_mcore_forward_fn(self.hf_config, use_sequence_packing=self.use_sequence_packing)
                     output = forward_fn(
                         model=model,
