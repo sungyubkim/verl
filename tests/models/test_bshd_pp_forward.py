@@ -44,8 +44,11 @@ Run with:
     # 1+ GPUs - Compare THD vs BSHD outputs
     torchrun --nproc_per_node=1 tests/models/test_bshd_pp_forward.py --test compare
 
+    # 2 GPUs - Verify SP actually divides sequences across TP ranks
+    torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test sp_verify
+
 Options:
-    --test: Test configuration (basic, pp_only, pp_tp, pp_cp, all, tp_only, cp_only, compare, actor)
+    --test: Test configuration (basic, pp_only, pp_tp, pp_cp, all, tp_only, cp_only, compare, actor, sp_verify)
     --bridge: Weight loading bridge to use
         - mbridge: Use mbridge package (vanilla_mbridge=True, default)
         - megatron: Use megatron.bridge (vanilla_mbridge=False)
@@ -288,6 +291,222 @@ def test_bshd_forward(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     print(f"[Rank {rank}] Test completed successfully!")
+
+
+def test_sp_verification(
+    tp_size: int = 2,
+    pp_size: int = 1,
+    cp_size: int = 1,
+    vanilla_mbridge: bool = True,
+):
+    """Verify that Sequence Parallelism (SP) actually divides sequences across TP ranks.
+
+    This test captures intermediate tensor shapes using forward hooks to verify that:
+    1. After embedding + scatter: tensors have shape [batch, seq_len/TP, hidden]
+    2. Throughout decoder layers: tensors maintain [batch, seq_len/TP, hidden]
+    3. After final gather: output returns to [batch, seq_len, hidden]
+
+    This proves SP is actually working, not just passing through without effect.
+
+    Args:
+        tp_size: Tensor parallel size (should be > 1 for SP to be active)
+        pp_size: Pipeline parallel size
+        cp_size: Context parallel size
+        vanilla_mbridge: If True, use mbridge; if False, use megatron.bridge
+    """
+    import megatron.core.parallel_state as mpu
+
+    from verl.models.mcore import get_mcore_forward_fn
+    from verl.trainer.config import CheckpointConfig
+    from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+    from verl.workers.engine import EngineRegistry
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    torch.cuda.set_device(local_rank)
+
+    # Initialize distributed
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    # Create test model (only on rank 0)
+    tmp_dir = tempfile.mkdtemp(prefix="verl_test_sp_verify_")
+    if rank == 0:
+        model_path = create_test_model(tmp_dir)
+        print(f"[Rank {rank}] Created test model at: {model_path}")
+    else:
+        model_path = ""
+
+    dist.barrier()
+    model_path = broadcast_model_path(model_path if rank == 0 else "", rank)
+    dist.barrier()
+
+    # Configure engine with TP > 1 (this enables sequence_parallel automatically)
+    model_config = HFModelConfig(path=model_path, load_tokenizer=False)
+    engine_config = McoreEngineConfig(
+        forward_only=True,
+        use_mbridge=True,
+        vanilla_mbridge=vanilla_mbridge,
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        context_parallel_size=cp_size,
+    )
+    optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
+    checkpoint_config = CheckpointConfig()
+
+    # Build engine
+    engine = EngineRegistry.new(
+        model_type="language_model",
+        backend="megatron",
+        model_config=model_config,
+        engine_config=engine_config,
+        optimizer_config=optimizer_config,
+        checkpoint_config=checkpoint_config,
+    )
+    engine.initialize()
+
+    # Get actual TP size and SP status from parallel state
+    actual_tp_size = mpu.get_tensor_model_parallel_world_size()
+    model = engine.module[0]
+
+    # Check if sequence_parallel is enabled in model config
+    sequence_parallel = getattr(model.config, "sequence_parallel", False)
+    print(f"[Rank {rank}] TP size: {actual_tp_size}, sequence_parallel: {sequence_parallel}")
+
+    if actual_tp_size > 1 and not sequence_parallel:
+        print(f"[Rank {rank}] WARNING: TP > 1 but sequence_parallel is False!")
+
+    # Create test batch with sequence length divisible by TP size
+    batch_size = 4
+    seqlen = 64  # Must be divisible by tp_size for SP
+    assert seqlen % tp_size == 0, f"seqlen ({seqlen}) must be divisible by tp_size ({tp_size})"
+    vocab_size = model_config.hf_config.vocab_size
+
+    batch = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
+
+    # Storage for captured shapes
+    captured_shapes = []
+    hook_handles = []
+
+    def make_shape_capture_hook(layer_name):
+        """Create a hook that captures output tensor shapes."""
+
+        def hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                captured_shapes.append((layer_name, output.shape))
+            elif isinstance(output, tuple) and len(output) > 0 and isinstance(output[0], torch.Tensor):
+                captured_shapes.append((layer_name, output[0].shape))
+
+        return hook
+
+    # Register hooks on decoder layers to capture intermediate shapes
+    # The decoder layers process tensors in SP-divided format
+    if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
+        for idx, layer in enumerate(model.decoder.layers):
+            handle = layer.register_forward_hook(make_shape_capture_hook(f"decoder_layer_{idx}"))
+            hook_handles.append(handle)
+        print(f"[Rank {rank}] Registered hooks on {len(model.decoder.layers)} decoder layers")
+    else:
+        print(f"[Rank {rank}] WARNING: Could not find decoder layers for hook registration")
+
+    # Define a simple logits processor
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+    def logits_processor(logits, label, label_mask):
+        assert logits.shape[:2] == label.shape[:2], (
+            f"Shape mismatch: logits {logits.shape[:2]} vs label {label.shape[:2]}"
+        )
+        log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+        log_probs = log_probs.masked_fill(~label_mask, 0.0)
+        return {"log_probs": log_probs}
+
+    logits_processor_args = {"label": batch["label"], "label_mask": batch["label_mask"]}
+
+    # Get BSHD forward function
+    bshd_forward = get_mcore_forward_fn(model_config.hf_config, use_sequence_packing=False)
+
+    # Run forward pass
+    try:
+        captured_shapes.clear()  # Clear any previous captures
+
+        output = bshd_forward(
+            model=model,
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            multi_modal_inputs={},
+            logits_processor=logits_processor,
+            logits_processor_args=logits_processor_args,
+        )
+
+        # Remove hooks
+        for handle in hook_handles:
+            handle.remove()
+
+        # Analyze captured shapes
+        print(f"\n[Rank {rank}] === SP Verification Results ===")
+        print(f"[Rank {rank}] Input sequence length: {seqlen}")
+        print(f"[Rank {rank}] TP size: {actual_tp_size}")
+        print(f"[Rank {rank}] Expected SP seq_len: {seqlen // actual_tp_size if sequence_parallel else seqlen}")
+        print(f"[Rank {rank}] Captured {len(captured_shapes)} layer outputs:")
+
+        sp_working = True
+        expected_sp_seq_len = seqlen // actual_tp_size if sequence_parallel else seqlen
+
+        for layer_name, shape in captured_shapes:
+            actual_seq_len = shape[1] if len(shape) > 1 else "N/A"
+            status = "✓" if actual_seq_len == expected_sp_seq_len else "✗"
+            print(f"[Rank {rank}]   {status} {layer_name}: {shape}")
+
+            if actual_seq_len != expected_sp_seq_len:
+                sp_working = False
+
+        # Verify final output shape (should be gathered back to full seq_len)
+        if mpu.is_pipeline_last_stage():
+            log_probs = output["log_probs"]
+            print(f"\n[Rank {rank}] Final output shape: {log_probs.shape}")
+            print(f"[Rank {rank}] Expected final shape: [{batch_size}, {seqlen}]")
+
+            if log_probs.shape[1] == seqlen:
+                print(f"[Rank {rank}] ✓ Final output correctly gathered to full sequence length")
+            else:
+                print(f"[Rank {rank}] ✗ Final output NOT correctly gathered!")
+                sp_working = False
+
+        # Summary
+        print(f"\n[Rank {rank}] === Summary ===")
+        if sequence_parallel and actual_tp_size > 1:
+            if sp_working:
+                print(f"[Rank {rank}] ✓ SP is working correctly!")
+                print(f"[Rank {rank}]   - Decoder layers process seq_len/{actual_tp_size} = {expected_sp_seq_len}")
+                print(f"[Rank {rank}]   - Output is gathered back to seq_len = {seqlen}")
+            else:
+                print(f"[Rank {rank}] ✗ SP verification FAILED!")
+                print(f"[Rank {rank}]   - Expected intermediate seq_len: {expected_sp_seq_len}")
+                print(f"[Rank {rank}]   - Check if scatter_embedding_sequence_parallel is enabled")
+                raise AssertionError("SP verification failed: tensor shapes don't match expected SP pattern")
+        else:
+            print(f"[Rank {rank}] ⚠ SP is not active (TP={actual_tp_size}, SP={sequence_parallel})")
+            print(f"[Rank {rank}]   - This is expected when TP=1")
+
+    except Exception as e:
+        # Remove hooks on error
+        for handle in hook_handles:
+            handle.remove()
+        print(f"[Rank {rank}] ✗ ERROR: {type(e).__name__}: {e}")
+        raise
+
+    # Cleanup
+    dist.barrier()
+    mpu.destroy_model_parallel()
+    dist.destroy_process_group()
+
+    if rank == 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    print(f"[Rank {rank}] SP verification test completed!")
 
 
 def test_bshd_pp_forward(
@@ -708,7 +927,7 @@ def main():
         "--test",
         type=str,
         default="basic",
-        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor"],
+        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor", "sp_verify"],
         help="Test configuration to run",
     )
     parser.add_argument(
@@ -780,6 +999,13 @@ def main():
         # Note: This test requires the combined_1f1b scheduler for PP>1
         # For now, we use PP=1 to avoid scheduler compatibility issues
         test_actor_worker_integration(tp_size=1, pp_size=1, cp_size=1)
+
+    elif args.test == "sp_verify":
+        # PP=1, TP=2, CP=1 (requires 2 GPUs)
+        # Verify that Sequence Parallelism actually divides sequences across TP ranks
+        # This test captures intermediate tensor shapes to prove SP is working
+        assert world_size >= 2, f"Need at least 2 GPUs, got {world_size}"
+        test_sp_verification(tp_size=2, pp_size=1, cp_size=1, vanilla_mbridge=vanilla_mbridge)
 
 
 if __name__ == "__main__":
