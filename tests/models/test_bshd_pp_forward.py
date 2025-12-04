@@ -230,9 +230,13 @@ def test_bshd_pp_forward(
 
     # Define forward_step function for forward_backward_func
     def forward_step(batch_iter, model):
-        """Forward step that returns schedule plan for PP scheduling."""
+        """Forward step that returns (output, loss_func) tuple for PP scheduling.
+
+        The forward_backward_func expects forward_step to return a tuple of (output, loss_func).
+        For forward_only=True, loss_func should be None.
+        """
         micro_batch = next(batch_iter)
-        return gptmodel_forward_1f1b_overlap_bshd(
+        output = gptmodel_forward_1f1b_overlap_bshd(
             model=model,
             input_ids=micro_batch["input_ids"],
             position_ids=micro_batch["position_ids"],
@@ -247,6 +251,8 @@ def test_bshd_pp_forward(
             },
             temperature=1.0,
         )
+        # Return (output, loss_func) tuple - loss_func=None for forward_only mode
+        return output, None
 
     # Run BSHD forward with PP using forward_backward_func
     try:
