@@ -344,6 +344,7 @@ def remove_left_padding(
     position_ids: torch.Tensor,
     sequence_parallel: bool = False,
     pre_process: bool = True,
+    fixed_seq_len: int = None,
 ):
     """
     Remove left padding from input_ids, attention_mask and position_ids.
@@ -354,6 +355,16 @@ def remove_left_padding(
     - GPU0: chunk[0] + chunk[-1] (first and last)
     - GPU1: chunk[1] + chunk[-2] (second and second-last)
     - ...
+
+    Args:
+        input_ids: Input token IDs tensor
+        attention_mask: 2D attention mask tensor
+        position_ids: Position IDs tensor
+        sequence_parallel: Whether sequence parallelism is enabled
+        pre_process: Whether this rank handles input preprocessing
+        fixed_seq_len: If provided, use this as the sequence length instead of
+            computing from attention_mask. Required for PP>1 to ensure consistent
+            tensor shapes across micro-batches for P2P communication buffers.
 
     Returns:
         new_input_ids: Right-padded input_ids (split for CP if cp_size > 1)
@@ -370,7 +381,13 @@ def remove_left_padding(
     batch_size = input_ids.shape[0]
     shape = list(input_ids.shape)  # batch_size, seq_len,...
     seq_lens = attention_mask.sum(dim=1)
-    seq_len = seq_lens.max().item()
+
+    # Use fixed_seq_len if provided (for PP>1 to ensure consistent P2P buffer shapes)
+    # Otherwise, compute dynamically from attention_mask
+    if fixed_seq_len is not None:
+        seq_len = fixed_seq_len
+    else:
+        seq_len = seq_lens.max().item()
 
     # Calculate alignment based on CP, SP, and cuDNN requirements
     if cp_size > 1:

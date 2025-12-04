@@ -16,6 +16,7 @@
 
 
 import torch
+from megatron.core import parallel_state as mpu
 
 from verl.utils.megatron_utils import unwrap_model
 
@@ -111,6 +112,15 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
             # This path is for models that require features incompatible with THD format
             # (e.g., learnable softmax in TransformerEngine)
             sequence_parallel = unwrap_model(model).config.sequence_parallel
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+
+            # For PP>1, use fixed sequence length to ensure consistent P2P buffer shapes.
+            # Without this, remove_left_padding computes seq_len dynamically per micro-batch,
+            # causing P2P send/recv buffer mismatches and deadlocks.
+            if pp_size > 1:
+                fixed_seq_len = attention_mask.shape[1]  # Use original padded length
+            else:
+                fixed_seq_len = None  # Dynamic computation (original behavior)
 
             # Remove left padding and convert to right-padded format
             new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
@@ -119,6 +129,7 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 position_ids,
                 sequence_parallel=sequence_parallel,
                 pre_process=pre_process,
+                fixed_seq_len=fixed_seq_len,
             )
 
             input_args = dict(
@@ -148,10 +159,11 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                         position_ids,
                         sequence_parallel=sequence_parallel,
                         pre_process=True,
+                        fixed_seq_len=fixed_seq_len,  # Use same fixed_seq_len for consistency
                     )
                     converted = converted.squeeze(-1)  # [batch, new_seq_len, 1] -> [batch, new_seq_len]
 
-                    # Pad to match output_orig.shape[1] if needed (PP fixed shape handling)
+                    # Defensive padding: should not be needed with fixed_seq_len, but kept as safety net
                     if converted.shape[1] < output_seq_len:
                         padding = torch.zeros(
                             converted.shape[0],
@@ -161,14 +173,13 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                         )
                         converted = torch.cat([converted, padding], dim=1)
                     elif converted.shape[1] > output_seq_len:
-                        # Defensive: truncate if larger (should not happen normally)
                         converted = converted[:, :output_seq_len]
 
                     args[k] = converted
                 output_dict = logits_processor(output_orig, **args)
 
-                # Also pad new_attention_mask to match output_seq_len for recover_left_padding
-                # recover_left_padding expects result.shape[1] == attention_mask.shape[-1]
+                # Defensive padding for new_attention_mask: should not be needed with fixed_seq_len,
+                # but kept as safety net for recover_left_padding compatibility
                 if new_attention_mask.shape[-1] < output_seq_len:
                     # Pad 4D attention mask [batch, 1, 1, seq] on the last dimension
                     padding_shape = list(new_attention_mask.shape)
