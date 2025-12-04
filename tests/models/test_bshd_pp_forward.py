@@ -66,7 +66,7 @@ os.environ["NCCL_DEBUG"] = "WARN"
 
 import torch
 import torch.distributed as dist
-from transformers import AutoModelForCausalLM, Qwen2MoeConfig, Qwen3Config
+from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3MoeConfig
 
 
 def create_test_model(tmp_dir: str) -> str:
@@ -92,7 +92,7 @@ def create_test_moe_model(tmp_dir: str) -> str:
     This model has Mixture of Experts (MoE) architecture which is required
     for build_schedule_plan to be available in Megatron-Core.
     """
-    config = Qwen2MoeConfig(
+    config = Qwen3MoeConfig(
         num_hidden_layers=4,  # Small model for testing
         hidden_size=256,
         intermediate_size=512,
@@ -102,7 +102,6 @@ def create_test_moe_model(tmp_dir: str) -> str:
         vocab_size=1000,
         num_experts=4,  # Number of experts
         num_experts_per_tok=2,  # Top-k experts per token
-        shared_expert_intermediate_size=256,
     )
     model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
     path = os.path.join(tmp_dir, "test_moe_model")
