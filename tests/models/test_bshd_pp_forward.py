@@ -26,17 +26,26 @@ Run with:
     # 2 GPUs - PP=2 (BSHD with pipeline parallelism)
     torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test pp_only
 
-    # 2 GPUs - TP=2 (BSHD with tensor parallelism)
+    # 4 GPUs - PP=2, TP=2 (BSHD with pipeline + tensor parallelism)
+    torchrun --nproc_per_node=4 tests/models/test_bshd_pp_forward.py --test pp_tp
+
+    # 4 GPUs - PP=2, CP=2 (BSHD with pipeline + context parallelism)
+    torchrun --nproc_per_node=4 tests/models/test_bshd_pp_forward.py --test pp_cp
+
+    # 8 GPUs - PP=2, TP=2, CP=2 (BSHD with all parallelism types)
+    torchrun --nproc_per_node=8 tests/models/test_bshd_pp_forward.py --test all
+
+    # 2 GPUs - TP=2 (BSHD with tensor parallelism, PP=1)
     torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test tp_only
 
-    # 2 GPUs - CP=2 (BSHD with context parallelism)
+    # 2 GPUs - CP=2 (BSHD with context parallelism, PP=1)
     torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test cp_only
 
     # 1+ GPUs - Compare THD vs BSHD outputs
     torchrun --nproc_per_node=1 tests/models/test_bshd_pp_forward.py --test compare
 
 Options:
-    --test: Test configuration (basic, pp_only, tp_only, cp_only, compare, actor)
+    --test: Test configuration (basic, pp_only, pp_tp, pp_cp, all, tp_only, cp_only, compare, actor)
     --bridge: Weight loading bridge to use
         - mbridge: Use mbridge package (vanilla_mbridge=True, default)
         - megatron: Use megatron.bridge (vanilla_mbridge=False)
@@ -699,7 +708,7 @@ def main():
         "--test",
         type=str,
         default="basic",
-        choices=["basic", "pp_only", "tp_only", "cp_only", "compare", "actor"],
+        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor"],
         help="Test configuration to run",
     )
     parser.add_argument(
@@ -730,6 +739,24 @@ def main():
         # Test BSHD with pipeline parallelism using forward_backward_func
         assert world_size >= 2, f"Need at least 2 GPUs, got {world_size}"
         test_bshd_pp_forward(tp_size=1, pp_size=2, cp_size=1, vanilla_mbridge=vanilla_mbridge)
+
+    elif args.test == "pp_tp":
+        # PP=2, TP=2, CP=1 (requires 4 GPUs)
+        # Test BSHD with pipeline + tensor parallelism
+        assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
+        test_bshd_pp_forward(tp_size=2, pp_size=2, cp_size=1, vanilla_mbridge=vanilla_mbridge)
+
+    elif args.test == "pp_cp":
+        # PP=2, TP=1, CP=2 (requires 4 GPUs)
+        # Test BSHD with pipeline + context parallelism
+        assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
+        test_bshd_pp_forward(tp_size=1, pp_size=2, cp_size=2, vanilla_mbridge=vanilla_mbridge)
+
+    elif args.test == "all":
+        # PP=2, TP=2, CP=2 (requires 8 GPUs)
+        # Test BSHD with all parallelism types
+        assert world_size >= 8, f"Need at least 8 GPUs, got {world_size}"
+        test_bshd_pp_forward(tp_size=2, pp_size=2, cp_size=2, vanilla_mbridge=vanilla_mbridge)
 
     elif args.test == "tp_only":
         # PP=1, TP=2, CP=1 (requires 2 GPUs)
