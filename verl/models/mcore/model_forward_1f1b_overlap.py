@@ -22,7 +22,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import make_viewless_tensor
 from torch import Tensor
 
-from verl.models.mcore.util import preprocess_packed_seqs
+from verl.models.mcore.util import preprocess_packed_seqs, remove_left_padding, recover_left_padding
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
@@ -248,5 +248,248 @@ def gptmodel_forward_1f1b_overlap(
             schedule_plan.post_process, schedule_plan.post_process.__class__
         )
         unwrap_model(model)._postprocess = _postprocess.__get__(unwrap_model(model), unwrap_model(model).__class__)
+
+    return schedule_plan
+
+
+def gptmodel_forward_1f1b_overlap_bshd(
+    model: GPTModel,
+    input_ids: Tensor,
+    position_ids: Tensor,
+    attention_mask: Tensor,
+    labels: Tensor = None,
+    labels_mask: Tensor = None,
+    multi_modal_inputs: Optional[dict] = None,
+    logits_processor: Optional[Callable] = None,
+    logits_processor_args: Optional[dict] = None,
+    temperature: float = 1.0,
+) -> TransformerModelChunkSchedulePlan:
+    """BSHD format version of 1F1B overlap forward for Pipeline Parallelism support.
+
+    This function is similar to gptmodel_forward_1f1b_overlap but uses BSHD format
+    instead of THD (packed sequences). It uses remove_left_padding/recover_left_padding
+    instead of preprocess_packed_seqs/postprocess_packed_seqs.
+
+    Args:
+        model: The GPT model
+        input_ids: Input token IDs [batch_size, seq_len]
+        position_ids: Position IDs [batch_size, seq_len]
+        attention_mask: Attention mask [batch_size, seq_len]
+        labels: Labels for loss computation
+        labels_mask: Mask for valid label positions
+        multi_modal_inputs: Optional multi-modal inputs (not used in BSHD path)
+        logits_processor: Optional function to process logits
+        logits_processor_args: Arguments for logits_processor
+        temperature: Temperature for logits scaling
+
+    Returns:
+        TransformerModelChunkSchedulePlan for PP scheduling
+    """
+    pre_process: bool = unwrap_model(model).pre_process
+    post_process: bool = unwrap_model(model).post_process
+    sequence_parallel: bool = unwrap_model(model).config.sequence_parallel
+
+    batch_size, seq_len = attention_mask.shape[:2]
+
+    # BSHD conversion: use remove_left_padding instead of preprocess_packed_seqs
+    new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
+        input_ids,
+        attention_mask,
+        position_ids,
+        sequence_parallel=sequence_parallel,
+        pre_process=pre_process,
+    )
+    if pre_process:
+        new_input_ids = new_input_ids.contiguous()
+
+    # Build PP schedule plan with BSHD format (packed_seq_params=None)
+    schedule_plan = model.build_schedule_plan(
+        input_ids=new_input_ids,
+        attention_mask=new_attention_mask,  # 4D mask [batch, 1, 1, seq_len]
+        labels=labels,
+        position_ids=new_position_ids,
+        packed_seq_params=None,  # BSHD doesn't use packed sequences
+    )
+
+    if post_process:
+        # Store original masks for recovery
+        attention_mask_out = attention_mask  # Original 2D mask
+        new_attention_mask_out = new_attention_mask  # Transformed 4D mask
+
+        def _postprocess_bshd(
+            self,
+            hidden_states,
+            input_ids,
+            position_ids,
+            labels,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            mtp_in_postprocess=None,
+            loss_mask=None,
+            decoder_input=None,
+            attention_mask=None,
+            inference_params=None,
+            packed_seq_params=None,
+            sequence_len_offset=None,
+            runtime_gather_output=None,
+            extra_block_kwargs=None,
+            inference_context=None,
+        ):
+            """BSHD version of postprocess for PP scheduling."""
+            from megatron.core import parallel_state
+            from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+
+            in_inference_mode = inference_context is not None and not self.training
+            if in_inference_mode:
+                assert runtime_gather_output, "Inference must always gather TP logits"
+
+            # Get output weight
+            output_weight = None
+            if self.share_embeddings_and_output_weights:
+                output_weight = self.shared_embedding_or_output_weight()
+
+            # Handle MTP if enabled
+            if mtp_in_postprocess:
+                hidden_states = self.mtp(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    inference_params=inference_params,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    embedding=self.embedding,
+                    **(extra_block_kwargs or {}),
+                )
+
+            if not self.post_process:
+                return hidden_states
+
+            # Process with logits_processor (BSHD path supports this)
+            if logits_processor is not None:
+                logits, _ = self.output_layer(
+                    hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+                )
+                # Transpose from [seq, batch, vocab] to [batch, seq, vocab]
+                output_orig = logits.transpose(0, 1).contiguous()
+
+                # Convert logits_processor_args to BSHD format
+                args = {}
+                for k, v in logits_processor_args.items():
+                    # Use remove_left_padding for 2D tensors
+                    converted, _, _ = remove_left_padding(
+                        v.unsqueeze(-1),  # [batch, seq] -> [batch, seq, 1]
+                        attention_mask_out,
+                        position_ids,
+                        sequence_parallel=sequence_parallel,
+                        pre_process=True,
+                    )
+                    args[k] = converted.squeeze(-1)  # [batch, new_seq, 1] -> [batch, new_seq]
+
+                output_dict = logits_processor(output_orig, **args)
+
+                # Recover to original left-padded format
+                output = {
+                    k: recover_left_padding(
+                        v, new_attention_mask_out, attention_mask_out, seq_len, post_process=True
+                    )
+                    for k, v in output_dict.items()
+                }
+            else:
+                # Fused kernel path for BSHD
+                labels_converted, _, _ = remove_left_padding(
+                    labels.unsqueeze(-1),
+                    attention_mask_out,
+                    position_ids,
+                    sequence_parallel=sequence_parallel,
+                    pre_process=True,
+                )
+                labels_rmpad = labels_converted.squeeze(-1).contiguous()
+
+                labels_mask_converted, _, _ = remove_left_padding(
+                    labels_mask.unsqueeze(-1),
+                    attention_mask_out,
+                    position_ids,
+                    sequence_parallel=sequence_parallel,
+                    pre_process=True,
+                )
+                labels_mask_rmpad = labels_mask_converted.squeeze(-1).contiguous()
+
+                output = CausalLMOutputForPPO(
+                    loss=None,
+                    logits=None,
+                    past_key_values=None,
+                    hidden_states=hidden_states,
+                    attentions=None,
+                )
+
+                if self.config.sequence_parallel:
+                    hidden_states = gather_from_sequence_parallel_region(hidden_states)
+
+                logprobs, entropy = linear_cross_entropy(
+                    hidden_states,
+                    self.output_layer.weight,
+                    labels_rmpad,
+                    temperature,
+                    "none",
+                    parallel_state.get_tensor_model_parallel_group(),
+                )
+                output.entropy = entropy
+                output.log_probs = logprobs
+
+                # Recover to original format
+                log_probs_recovered = recover_left_padding(
+                    output.log_probs, new_attention_mask_out, attention_mask_out, seq_len, post_process=True
+                )
+                entropy_recovered = recover_left_padding(
+                    output.entropy, new_attention_mask_out, attention_mask_out, seq_len, post_process=True
+                )
+
+                output = {
+                    "log_probs": log_probs_recovered,
+                    "entropy": entropy_recovered,
+                }
+
+            output_ = [output["log_probs"]]
+            output_ = tuple(output_)
+            return output_
+
+        def _custom_post_process_node_forward_impl_bshd(self, hidden_states):
+            """Custom post-process node forward for BSHD format."""
+            if self.gpt_model.decoder.final_layernorm and not self.gpt_model.mtp_process:
+                hidden_states = self.gpt_model.decoder.final_layernorm(hidden_states)
+                hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+            # Run GPTModel._postprocess with BSHD format
+            output = self.gpt_model._postprocess(
+                hidden_states=hidden_states,
+                input_ids=self.chunk_state.input_ids,
+                position_ids=self.chunk_state.position_ids,
+                labels=self.chunk_state.labels,
+                decoder_input=self.chunk_state.decoder_input,
+                rotary_pos_emb=self.chunk_state.rotary_pos_emb,
+                rotary_pos_cos=self.chunk_state.rotary_pos_cos,
+                rotary_pos_sin=self.chunk_state.rotary_pos_sin,
+                mtp_in_postprocess=False,
+                loss_mask=self.chunk_state.loss_mask,
+                attention_mask=self.chunk_state.attention_mask,
+                packed_seq_params=None,  # BSHD doesn't use packed_seq_params
+                sequence_len_offset=self.chunk_state.sequence_len_offset,
+                runtime_gather_output=self.chunk_state.runtime_gather_output,
+                extra_block_kwargs=self.chunk_state.extra_block_kwargs,
+            )
+            return output
+
+        # Patch postprocess methods
+        schedule_plan.post_process.forward_impl = _custom_post_process_node_forward_impl_bshd.__get__(
+            schedule_plan.post_process, schedule_plan.post_process.__class__
+        )
+        unwrap_model(model)._postprocess = _postprocess_bshd.__get__(
+            unwrap_model(model), unwrap_model(model).__class__
+        )
 
     return schedule_plan

@@ -570,11 +570,17 @@ class MegatronPPOActor(BasePPOActor):
                     multi_modal_inputs=multi_modal_inputs,
                 )
             else:
-                forward_fn = get_mcore_forward_fn(self.hf_config, use_sequence_packing=self.use_sequence_packing)
+                pp_size = mpu.get_pipeline_model_parallel_world_size()
 
                 def logits_processor(logits, label, label_mask):
-                    assert logits.shape[:2] == label.shape[:2]
-                    assert label.shape == label_mask.shape
+                    assert logits.shape[:2] == label.shape[:2], (
+                        f"Shape mismatch: logits {logits.shape[:2]} vs label {label.shape[:2]}. "
+                        f"This may happen in PP>1 with BSHD format. "
+                        f"Consider using use_fused_kernels=True or use_sequence_packing=True."
+                    )
+                    assert label.shape == label_mask.shape, (
+                        f"Shape mismatch: label {label.shape} vs label_mask {label_mask.shape}"
+                    )
                     logits.div_(temperature)
                     ret = {}
                     if calculate_entropy:
@@ -594,15 +600,36 @@ class MegatronPPOActor(BasePPOActor):
                     return ret
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
-                output = forward_fn(
-                    model=model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    multi_modal_inputs=multi_modal_inputs,
-                    logits_processor=logits_processor,
-                    logits_processor_args=logits_processor_args,
-                )
+
+                if pp_size > 1:
+                    # PP + non-fused: use BSHD 1F1B overlap forward
+                    # This is needed because model_forward_gen() doesn't handle PP scheduling
+                    from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap_bshd
+
+                    output = gptmodel_forward_1f1b_overlap_bshd(
+                        model=model,
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        attention_mask=attention_mask,
+                        labels=label,
+                        labels_mask=label_mask,
+                        multi_modal_inputs=multi_modal_inputs,
+                        logits_processor=logits_processor,
+                        logits_processor_args=logits_processor_args,
+                        temperature=temperature,
+                    )
+                else:
+                    # Non-PP: use existing model_forward_gen
+                    forward_fn = get_mcore_forward_fn(self.hf_config, use_sequence_packing=self.use_sequence_packing)
+                    output = forward_fn(
+                        model=model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        multi_modal_inputs=multi_modal_inputs,
+                        logits_processor=logits_processor,
+                        logits_processor_args=logits_processor_args,
+                    )
 
             if forward_only:
                 meta_info = None

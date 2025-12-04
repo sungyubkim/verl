@@ -1,0 +1,545 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Unit tests for BSHD + Pipeline Parallelism support.
+
+This test verifies that the BSHD (non-sequence-packing) format works correctly
+with Pipeline Parallelism (PP > 1). The key function being tested is
+`gptmodel_forward_1f1b_overlap_bshd` which enables PP support for BSHD format.
+
+Run with:
+    # 2 GPUs - PP=2, TP=1
+    torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test pp_only
+
+    # 4 GPUs - PP=2, TP=2
+    torchrun --nproc_per_node=4 tests/models/test_bshd_pp_forward.py --test pp_tp
+
+    # 4 GPUs - PP=2, CP=2
+    torchrun --nproc_per_node=4 tests/models/test_bshd_pp_forward.py --test pp_cp
+
+    # 8 GPUs - PP=2, TP=2, CP=2
+    torchrun --nproc_per_node=8 tests/models/test_bshd_pp_forward.py --test all
+"""
+
+import argparse
+import os
+import shutil
+import tempfile
+
+os.environ["NCCL_DEBUG"] = "WARN"
+
+import torch
+import torch.distributed as dist
+from transformers import AutoModelForCausalLM, Qwen3Config
+
+
+def create_test_model(tmp_dir: str) -> str:
+    """Create a small test model for testing."""
+    config = Qwen3Config(
+        num_hidden_layers=4,  # Small model for testing
+        hidden_size=256,
+        intermediate_size=512,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=1000,
+    )
+    model = AutoModelForCausalLM.from_config(config)
+    path = os.path.join(tmp_dir, "test_model")
+    model.save_pretrained(path)
+    config.save_pretrained(path)
+    return path
+
+
+def create_test_batch(
+    batch_size: int,
+    seqlen: int,
+    vocab_size: int,
+    device: torch.device,
+):
+    """Create a test batch with random data and left-padded attention masks."""
+    from verl.utils.model import compute_position_id_with_mask, create_random_mask
+
+    torch.manual_seed(42)
+
+    input_ids = torch.randint(0, vocab_size, (batch_size, seqlen), device=device)
+    attention_mask = create_random_mask(
+        input_ids=input_ids,
+        max_ratio_of_valid_token=0.8,
+        max_ratio_of_left_padding=0.2,
+        min_ratio_of_valid_token=0.6,
+    )
+    position_ids = compute_position_id_with_mask(attention_mask)
+
+    response_length = seqlen // 2
+    responses = input_ids[:, response_length:]
+
+    # Create labels (shifted input_ids for next-token prediction)
+    label = position_ids.clone()
+    label[:, -response_length - 1 : -1] = responses
+
+    # Create label mask (only compute loss on response tokens)
+    label_mask = attention_mask.clone()
+    label_mask[:, : -response_length - 1] = False
+    label_mask[:, -1] = False
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask.to(bool),
+        "position_ids": position_ids,
+        "label": label,
+        "label_mask": label_mask.to(bool),
+        "responses": responses,
+        "response_length": response_length,
+    }
+
+
+def broadcast_model_path(model_path: str, rank: int) -> str:
+    """Broadcast model path from rank 0 to all other ranks."""
+    if rank == 0:
+        path_bytes = model_path.encode("utf-8")
+        path_tensor = torch.tensor(
+            list(path_bytes) + [0] * (512 - len(path_bytes)), dtype=torch.int64, device="cuda"
+        )
+    else:
+        path_tensor = torch.zeros(512, dtype=torch.int64, device="cuda")
+
+    dist.broadcast(path_tensor, src=0)
+
+    path_list = path_tensor.tolist()
+    model_path = bytes([b for b in path_list if b != 0]).decode("utf-8")
+    return model_path
+
+
+def test_bshd_pp_forward(
+    tp_size: int = 1,
+    pp_size: int = 2,
+    cp_size: int = 1,
+):
+    """Test BSHD forward with Pipeline Parallelism.
+
+    This test verifies that:
+    1. The BSHD 1F1B forward function works correctly with PP
+    2. The shape assertion (logits.shape[:2] == label.shape[:2]) passes
+    3. The output log_probs have correct shape
+    """
+    import megatron.core.parallel_state as mpu
+
+    from verl.trainer.config import CheckpointConfig
+    from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+    from verl.workers.engine import EngineRegistry
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    torch.cuda.set_device(local_rank)
+
+    # Initialize distributed
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    # Create test model (only on rank 0)
+    tmp_dir = tempfile.mkdtemp(prefix="verl_test_bshd_pp_")
+    if rank == 0:
+        model_path = create_test_model(tmp_dir)
+        print(f"[Rank {rank}] Created test model at: {model_path}")
+    else:
+        model_path = ""
+
+    dist.barrier()
+    model_path = broadcast_model_path(model_path if rank == 0 else "", rank)
+    dist.barrier()
+
+    # Configure engine
+    model_config = HFModelConfig(path=model_path, load_tokenizer=False)
+    engine_config = McoreEngineConfig(
+        forward_only=True,  # Forward only for testing
+        use_mbridge=True,
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        context_parallel_size=cp_size,
+    )
+    optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
+    checkpoint_config = CheckpointConfig()
+
+    # Build engine
+    engine = EngineRegistry.new(
+        model_type="language_model",
+        backend="megatron",
+        model_config=model_config,
+        engine_config=engine_config,
+        optimizer_config=optimizer_config,
+        checkpoint_config=checkpoint_config,
+    )
+    engine.initialize()
+
+    # Create test batch
+    batch_size = 4
+    seqlen = 64
+    vocab_size = model_config.hf_config.vocab_size
+
+    batch = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
+
+    # Import the BSHD forward function
+    from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap_bshd
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+    # Define logits processor (same as in megatron_actor.py)
+    def logits_processor(logits, label, label_mask):
+        # This is the assertion that was failing before the fix
+        assert logits.shape[:2] == label.shape[:2], (
+            f"Shape mismatch: logits {logits.shape[:2]} vs label {label.shape[:2]}"
+        )
+        assert label.shape == label_mask.shape, f"Shape mismatch: label {label.shape} vs label_mask {label_mask.shape}"
+
+        log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+        log_probs = log_probs.masked_fill(~label_mask, 0.0)
+        return {"log_probs": log_probs}
+
+    # Get model
+    model = engine.get_model()
+
+    # Run BSHD forward with PP
+    try:
+        output = gptmodel_forward_1f1b_overlap_bshd(
+            model=model,
+            input_ids=batch["input_ids"],
+            position_ids=batch["position_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["label"],
+            labels_mask=batch["label_mask"],
+            multi_modal_inputs={},
+            logits_processor=logits_processor,
+            logits_processor_args={
+                "label": batch["label"],
+                "label_mask": batch["label_mask"],
+            },
+            temperature=1.0,
+        )
+
+        # Check output on last PP stage
+        if mpu.is_pipeline_last_stage():
+            assert isinstance(output, dict), f"Expected dict output, got {type(output)}"
+            assert "log_probs" in output, "Output should contain log_probs"
+            assert output["log_probs"].shape == batch["label"].shape, (
+                f"log_probs shape {output['log_probs'].shape} != label shape {batch['label'].shape}"
+            )
+            print(f"[Rank {rank}] ✓ Forward passed! log_probs shape: {output['log_probs'].shape}")
+        else:
+            print(f"[Rank {rank}] ✓ Forward passed on non-last stage")
+
+    except AssertionError as e:
+        print(f"[Rank {rank}] ✗ FAILED: {e}")
+        raise
+    except Exception as e:
+        print(f"[Rank {rank}] ✗ ERROR: {type(e).__name__}: {e}")
+        raise
+
+    # Cleanup
+    dist.barrier()
+    mpu.destroy_model_parallel()
+    dist.destroy_process_group()
+
+    if rank == 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    print(f"[Rank {rank}] Test completed successfully!")
+
+
+def test_bshd_vs_thd_comparison(
+    tp_size: int = 1,
+    pp_size: int = 1,
+    cp_size: int = 1,
+):
+    """Compare BSHD and THD outputs for numerical correctness (PP=1 only).
+
+    This test verifies that BSHD and THD formats produce similar outputs
+    when PP=1 (where both should work).
+    """
+    import megatron.core.parallel_state as mpu
+
+    from verl.models.mcore import get_mcore_forward_fn
+    from verl.trainer.config import CheckpointConfig
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+    from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+    from verl.workers.engine import EngineRegistry
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    torch.cuda.set_device(local_rank)
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    # Create test model
+    tmp_dir = tempfile.mkdtemp(prefix="verl_test_compare_")
+    if rank == 0:
+        model_path = create_test_model(tmp_dir)
+    else:
+        model_path = ""
+
+    dist.barrier()
+    model_path = broadcast_model_path(model_path if rank == 0 else "", rank)
+    dist.barrier()
+
+    # Configure engine
+    model_config = HFModelConfig(path=model_path, load_tokenizer=False)
+    engine_config = McoreEngineConfig(
+        forward_only=True,
+        use_mbridge=True,
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        context_parallel_size=cp_size,
+    )
+
+    engine = EngineRegistry.new(
+        model_type="language_model",
+        backend="megatron",
+        model_config=model_config,
+        engine_config=engine_config,
+        optimizer_config=McoreOptimizerConfig(lr_decay_steps=10),
+        checkpoint_config=CheckpointConfig(),
+    )
+    engine.initialize()
+    model = engine.get_model()
+
+    # Create batch
+    batch = create_test_batch(4, 64, model_config.hf_config.vocab_size, torch.device("cuda"))
+
+    # Simple logits processor that returns log_probs
+    def simple_processor(logits, label, label_mask):
+        log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+        log_probs = log_probs.masked_fill(~label_mask, 0.0)
+        return {"log_probs": log_probs}
+
+    logits_processor_args = {"label": batch["label"], "label_mask": batch["label_mask"]}
+
+    # Run THD forward (use_sequence_packing=True)
+    thd_forward = get_mcore_forward_fn(model_config.hf_config, use_sequence_packing=True)
+    thd_output = thd_forward(
+        model=model,
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        position_ids=batch["position_ids"],
+        multi_modal_inputs={},
+        logits_processor=simple_processor,
+        logits_processor_args=logits_processor_args,
+    )
+
+    # Run BSHD forward (use_sequence_packing=False)
+    bshd_forward = get_mcore_forward_fn(model_config.hf_config, use_sequence_packing=False)
+    bshd_output = bshd_forward(
+        model=model,
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        position_ids=batch["position_ids"],
+        multi_modal_inputs={},
+        logits_processor=simple_processor,
+        logits_processor_args=logits_processor_args,
+    )
+
+    # Compare outputs
+    if mpu.is_pipeline_last_stage():
+        thd_log_probs = thd_output["log_probs"]
+        bshd_log_probs = bshd_output["log_probs"]
+
+        # Compare shapes
+        assert thd_log_probs.shape == bshd_log_probs.shape, (
+            f"Shape mismatch: THD {thd_log_probs.shape} vs BSHD {bshd_log_probs.shape}"
+        )
+
+        # Compare values (with tolerance for numerical differences)
+        # Only compare where label_mask is True (valid positions)
+        valid_mask = batch["label_mask"]
+        thd_valid = thd_log_probs[valid_mask]
+        bshd_valid = bshd_log_probs[valid_mask]
+
+        max_diff = torch.max(torch.abs(thd_valid - bshd_valid)).item()
+        mean_diff = torch.mean(torch.abs(thd_valid - bshd_valid)).item()
+
+        print(f"[Rank {rank}] THD vs BSHD comparison:")
+        print(f"  - Max diff: {max_diff:.6f}")
+        print(f"  - Mean diff: {mean_diff:.6f}")
+
+        # Allow some tolerance due to different computation order
+        assert max_diff < 1e-2, f"Max diff too large: {max_diff}"
+        print(f"[Rank {rank}] ✓ THD vs BSHD comparison passed!")
+
+    # Cleanup
+    dist.barrier()
+    mpu.destroy_model_parallel()
+    dist.destroy_process_group()
+
+    if rank == 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_actor_worker_integration(
+    tp_size: int = 1,
+    pp_size: int = 2,
+    cp_size: int = 1,
+):
+    """Integration test using ActorWorker with BSHD + PP configuration.
+
+    This test simulates the actual usage pattern in megatron_actor.py.
+    """
+    import numpy as np
+    import ray
+
+    from verl import DataProto
+    from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+    from verl.utils.model import compute_position_id_with_mask, create_random_mask
+    from verl.workers.config import ActorConfig, HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+    from verl.workers.roles import ActorWorker
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if rank != 0:
+        print(f"[Rank {rank}] Skipping ray test (only rank 0 runs ray tests)")
+        return
+
+    ray.init(ignore_reinit_error=True)
+
+    # Create test model
+    tmp_dir = tempfile.mkdtemp(prefix="verl_test_actor_")
+    model_path = create_test_model(tmp_dir)
+
+    try:
+        model_config = HFModelConfig(path=model_path, load_tokenizer=False)
+        engine_config = McoreEngineConfig(
+            forward_only=False,
+            use_mbridge=True,
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            context_parallel_size=cp_size,
+        )
+        optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
+
+        config = ActorConfig(
+            model_config=model_config,
+            engine=engine_config,
+            strategy="megatron",
+            ppo_micro_batch_size_per_gpu=256,
+            ppo_mini_batch_size=4,
+            optim=optimizer_config,
+            use_dynamic_bsz=True,
+            use_sequence_packing=False,  # BSHD format
+            use_fused_kernels=False,  # Non-fused kernels
+            rollout_n=1,
+        )
+
+        ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(ActorWorker), config=config)
+        resource_pool = RayResourcePool(process_on_nodes=[world_size])
+        wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls_with_init)
+
+        # Initialize model
+        wg.init_model()
+
+        # Create test data
+        batch_size = 8
+        seqlen = 32
+        response_length = seqlen // 2
+
+        torch.manual_seed(1)
+        np.random.seed(1)
+
+        input_ids = torch.randint(0, model_config.hf_config.vocab_size, (batch_size, seqlen))
+        attention_mask = create_random_mask(
+            input_ids=input_ids,
+            max_ratio_of_valid_token=0.8,
+            max_ratio_of_left_padding=0.2,
+            min_ratio_of_valid_token=0.6,
+        )
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+        global_token_num = torch.sum(attention_mask, dim=-1).tolist()
+
+        responses = input_ids[:, response_length:]
+        response_mask = attention_mask[:, response_length:]
+
+        data = DataProto.from_single_dict(
+            {
+                "input_ids": input_ids,
+                "prompts": input_ids[:, :response_length],
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "responses": responses,
+                "response_mask": response_mask,
+            },
+            meta_info={"temperature": 1.0, "global_token_num": global_token_num},
+        )
+
+        # Run forward pass
+        output = wg.compute_log_prob(data)
+
+        assert "old_log_probs" in output.batch, "Output should contain old_log_probs"
+        print(f"[Rank {rank}] ✓ ActorWorker integration test passed!")
+        print(f"  - old_log_probs shape: {output.batch['old_log_probs'].shape}")
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        ray.shutdown()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Test BSHD + Pipeline Parallelism support")
+    parser.add_argument(
+        "--test",
+        type=str,
+        default="pp_only",
+        choices=["pp_only", "pp_tp", "pp_cp", "all", "compare", "actor"],
+        help="Test configuration to run",
+    )
+    args = parser.parse_args()
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+
+    print(f"[Rank {rank}] Running test: {args.test} with world_size={world_size}")
+
+    if args.test == "pp_only":
+        # PP=2, TP=1, CP=1 (requires 2 GPUs)
+        assert world_size >= 2, f"Need at least 2 GPUs, got {world_size}"
+        test_bshd_pp_forward(tp_size=1, pp_size=2, cp_size=1)
+
+    elif args.test == "pp_tp":
+        # PP=2, TP=2, CP=1 (requires 4 GPUs)
+        assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
+        test_bshd_pp_forward(tp_size=2, pp_size=2, cp_size=1)
+
+    elif args.test == "pp_cp":
+        # PP=2, TP=1, CP=2 (requires 4 GPUs)
+        assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
+        test_bshd_pp_forward(tp_size=1, pp_size=2, cp_size=2)
+
+    elif args.test == "all":
+        # PP=2, TP=2, CP=2 (requires 8 GPUs)
+        assert world_size >= 8, f"Need at least 8 GPUs, got {world_size}"
+        test_bshd_pp_forward(tp_size=2, pp_size=2, cp_size=2)
+
+    elif args.test == "compare":
+        # Compare THD vs BSHD (PP=1, requires at least 1 GPU)
+        test_bshd_vs_thd_comparison(tp_size=1, pp_size=1, cp_size=1)
+
+    elif args.test == "actor":
+        # Integration test with ActorWorker (requires matching GPUs)
+        test_actor_worker_integration(tp_size=1, pp_size=2, cp_size=1)
+
+
+if __name__ == "__main__":
+    main()
