@@ -166,8 +166,24 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
                     args[k] = converted
                 output_dict = logits_processor(output_orig, **args)
+
+                # Also pad new_attention_mask to match output_seq_len for recover_left_padding
+                # recover_left_padding expects result.shape[1] == attention_mask.shape[-1]
+                if new_attention_mask.shape[-1] < output_seq_len:
+                    # Pad 4D attention mask [batch, 1, 1, seq] on the last dimension
+                    padding_shape = list(new_attention_mask.shape)
+                    padding_shape[-1] = output_seq_len - new_attention_mask.shape[-1]
+                    mask_padding = torch.zeros(
+                        padding_shape,
+                        dtype=new_attention_mask.dtype,
+                        device=new_attention_mask.device,
+                    )
+                    new_attention_mask_padded = torch.cat([new_attention_mask, mask_padding], dim=-1)
+                else:
+                    new_attention_mask_padded = new_attention_mask
+
                 output = {
-                    k: recover_left_padding(v, new_attention_mask, attention_mask, seq_len, post_process=post_process)
+                    k: recover_left_padding(v, new_attention_mask_padded, attention_mask, seq_len, post_process=post_process)
                     for k, v in output_dict.items()
                 }
             else:
