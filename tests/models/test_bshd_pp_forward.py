@@ -50,8 +50,8 @@ Run with:
 Options:
     --test: Test configuration (basic, pp_only, pp_tp, pp_cp, all, tp_only, cp_only, compare, actor, sp_verify)
     --bridge: Weight loading bridge to use
-        - mbridge: Use mbridge package (vanilla_mbridge=True, default)
-        - megatron: Use megatron.bridge (vanilla_mbridge=False)
+        - mbridge: Use mbridge package (vanilla_mbridge=True)
+        - megatron: Use megatron.bridge (vanilla_mbridge=False, default)
 """
 
 import argparse
@@ -683,11 +683,18 @@ def test_bshd_vs_thd_comparison(
     tp_size: int = 1,
     pp_size: int = 1,
     cp_size: int = 1,
+    vanilla_mbridge: bool = False,
 ):
     """Compare BSHD and THD outputs for numerical correctness (PP=1 only).
 
     This test verifies that BSHD and THD formats produce similar outputs
     when PP=1 (where both should work).
+
+    Args:
+        tp_size: Tensor parallel size
+        pp_size: Pipeline parallel size
+        cp_size: Context parallel size
+        vanilla_mbridge: If True, use mbridge; if False, use megatron.bridge
     """
     import megatron.core.parallel_state as mpu
 
@@ -722,6 +729,7 @@ def test_bshd_vs_thd_comparison(
     engine_config = McoreEngineConfig(
         forward_only=True,
         use_mbridge=True,
+        vanilla_mbridge=vanilla_mbridge,
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=cp_size,
@@ -933,9 +941,9 @@ def main():
     parser.add_argument(
         "--bridge",
         type=str,
-        default="mbridge",
+        default="megatron",
         choices=["mbridge", "megatron"],
-        help="Bridge to use: 'mbridge' (vanilla_mbridge=True) or 'megatron' (vanilla_mbridge=False)",
+        help="Bridge to use: 'mbridge' (vanilla_mbridge=True) or 'megatron' (vanilla_mbridge=False, default)",
     )
     args = parser.parse_args()
 
@@ -992,7 +1000,7 @@ def main():
     elif args.test == "compare":
         # Compare THD vs BSHD (PP=1, requires at least 1 GPU)
         # Verify numerical equivalence between THD and BSHD formats
-        test_bshd_vs_thd_comparison(tp_size=1, pp_size=1, cp_size=1)
+        test_bshd_vs_thd_comparison(tp_size=1, pp_size=1, cp_size=1, vanilla_mbridge=vanilla_mbridge)
 
     elif args.test == "actor":
         # Integration test with ActorWorker
