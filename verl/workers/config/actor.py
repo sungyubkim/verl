@@ -228,13 +228,9 @@ class McoreActorConfig(ActorConfig):
                     "Fused kernels require sequence packing. "
                     "Set use_sequence_packing=True or use_fused_kernels=False."
                 )
-            # Context Parallelism requires sequence packing
-            cp_size = getattr(self.megatron, "context_parallel_size", 1)
-            if cp_size > 1:
-                raise ValueError(
-                    f"Context Parallelism (context_parallel_size={cp_size}) requires sequence packing. "
-                    f"Set use_sequence_packing=True or context_parallel_size=1."
-                )
+            # Note: Context Parallelism now works with both sequence packing (THD) and
+            # non-packing (BSHD) modes. The remove_left_padding/recover_left_padding
+            # functions handle CP chunk splitting/reassembly for BSHD format.
 
 
 @dataclass

@@ -348,44 +348,106 @@ def remove_left_padding(
     """
     Remove left padding from input_ids, attention_mask and position_ids.
 
+    When Context Parallelism (CP) is enabled, this function also splits each sequence
+    into chunks distributed across CP ranks. Each GPU gets 2 chunks following the
+    load-balancing pattern for causal masking:
+    - GPU0: chunk[0] + chunk[-1] (first and last)
+    - GPU1: chunk[1] + chunk[-2] (second and second-last)
+    - ...
+
     Returns:
-        new_input_ids: Right-padded input_ids
+        new_input_ids: Right-padded input_ids (split for CP if cp_size > 1)
         new_attention_mask: 4D attention mask [batch_size, 1, 1, seq_len] for
             TransformerEngine FusedAttention compatibility with BSHD format
-        new_position_ids: Right-padded position_ids
+        new_position_ids: Right-padded position_ids (split for CP if cp_size > 1)
     """
     assert attention_mask.ndim == 2
     assert position_ids.ndim == 2
+
     cp_size = mpu.get_context_parallel_world_size()
-    assert cp_size == 1, "Context parallel size without seq_pack is not supported"
+    cp_rank = mpu.get_context_parallel_rank()
+
     batch_size = input_ids.shape[0]
     shape = list(input_ids.shape)  # batch_size, seq_len,...
     seq_lens = attention_mask.sum(dim=1)
     seq_len = seq_lens.max().item()
-    if sequence_parallel:
+
+    # Calculate alignment based on CP, SP, and cuDNN requirements
+    if cp_size > 1:
+        # CP requires alignment to cp_size * 2 * 64 for proper chunk splitting
+        sp_world_size = mpu.get_tensor_model_parallel_world_size() if sequence_parallel else 1
+        alignment = cp_size * 2 * max(64, sp_world_size)
+    elif sequence_parallel:
         sp_world_size = mpu.get_tensor_model_parallel_world_size()
-        pad_size = (sp_world_size - seq_len % sp_world_size) % sp_world_size
-        seq_len = seq_len + pad_size
+        alignment = sp_world_size
     else:
         # Pad to multiple of 64 for cuDNN FusedAttention kernel alignment
         # Reference: https://docs.nvidia.com/deeplearning/cudnn/frontend/v1.9.0/operations/Attention.html
-        # All FusedAttention backends require seq_len % 64 == 0
         alignment = 64
-        pad_size = (alignment - seq_len % alignment) % alignment
-        seq_len = seq_len + pad_size
-    shape[1] = seq_len
+
+    pad_size = (alignment - seq_len % alignment) % alignment
+    seq_len_padded = seq_len + pad_size
+
+    if cp_size > 1:
+        # Each GPU gets seq_len_padded / cp_size tokens after splitting
+        seq_len_per_gpu = seq_len_padded // cp_size
+        shape[1] = seq_len_per_gpu
+    else:
+        shape[1] = seq_len_padded
+
     if pre_process:
         new_input_ids = torch.zeros(dtype=input_ids.dtype, device=input_ids.device, size=shape)
+
     # Create 2D mask first, then convert to 4D for FusedAttention
     new_attention_mask_2d = torch.zeros(
-        dtype=attention_mask.dtype, device=attention_mask.device, size=(batch_size, seq_len)
+        dtype=attention_mask.dtype, device=attention_mask.device, size=(batch_size, shape[1])
     )
-    new_position_ids = torch.zeros(dtype=position_ids.dtype, device=position_ids.device, size=(batch_size, seq_len))
+    new_position_ids = torch.zeros(dtype=position_ids.dtype, device=position_ids.device, size=(batch_size, shape[1]))
+
     for i in range(batch_size):
-        if pre_process:
-            new_input_ids[i, : seq_lens[i]] = input_ids[i, attention_mask[i]]
-        new_attention_mask_2d[i, : seq_lens[i]] = attention_mask[i, attention_mask[i]]
-        new_position_ids[i, : seq_lens[i]] = position_ids[i, attention_mask[i]]
+        valid_len = seq_lens[i].item()
+
+        if cp_size <= 1:
+            # Standard path: simple right-padding conversion
+            if pre_process:
+                new_input_ids[i, :valid_len] = input_ids[i, attention_mask[i]]
+            new_attention_mask_2d[i, :valid_len] = attention_mask[i, attention_mask[i]]
+            new_position_ids[i, :valid_len] = position_ids[i, attention_mask[i]]
+        else:
+            # CP chunk splitting path
+            # Split each sequence into cp_size * 2 chunks, each GPU gets 2 chunks
+            chunk_size = seq_len_padded // (cp_size * 2)
+            half_seq = seq_len_per_gpu // 2
+
+            # Extract original data (valid tokens only)
+            orig_data = input_ids[i, attention_mask[i]]  # [valid_len]
+            orig_pos = position_ids[i, attention_mask[i]]  # [valid_len]
+
+            # First chunk (from the front): chunk[cp_rank]
+            first_start = chunk_size * cp_rank
+            first_end = min(first_start + chunk_size, valid_len)
+            first_len = max(0, first_end - first_start)
+
+            if first_len > 0:
+                if pre_process:
+                    new_input_ids[i, :first_len] = orig_data[first_start:first_end]
+                new_attention_mask_2d[i, :first_len] = 1
+                new_position_ids[i, :first_len] = orig_pos[first_start:first_end]
+
+            # Second chunk (from the back): chunk[-(cp_rank+1)]
+            # For load balancing with causal masking
+            second_start = seq_len_padded - chunk_size * (cp_rank + 1)
+            second_end = seq_len_padded - chunk_size * cp_rank
+            # Clamp to valid token range
+            second_start = max(0, min(second_start, valid_len))
+            second_end = max(0, min(second_end, valid_len))
+            second_len = max(0, second_end - second_start)
+
+            if second_len > 0:
+                if pre_process:
+                    new_input_ids[i, half_seq : half_seq + second_len] = orig_data[second_start:second_end]
+                new_attention_mask_2d[i, half_seq : half_seq + second_len] = 1
+                new_position_ids[i, half_seq : half_seq + second_len] = orig_pos[second_start:second_end]
 
     # Convert to 4D [batch_size, 1, 1, seq_len] for TransformerEngine FusedAttention BSHD compatibility
     new_attention_mask = new_attention_mask_2d.unsqueeze(1).unsqueeze(1)
@@ -404,11 +466,26 @@ def recover_left_padding(
     post_process: bool = True,
 ):
     """
-    Recover left padding from result
-    return result
+    Recover left padding from result.
+
+    When Context Parallelism (CP) is enabled, this function first gathers results
+    from all CP ranks using all-gather, reassembles the chunks in the correct order,
+    then converts back to the original left-padded format.
+
+    Args:
+        result: Model output tensor [batch, seq_len_per_gpu, ...]
+        attention_mask: 4D or 2D attention mask from remove_left_padding
+        original_attention_mask: Original 2D attention mask before remove_left_padding
+        origin_seqlen: Original sequence length before any processing
+        post_process: Whether this rank does post-processing
+
+    Returns:
+        Tensor in original left-padded format [batch, origin_seqlen, ...]
     """
     if not post_process:
         return result
+
+    cp_size = mpu.get_context_parallel_world_size()
 
     # Handle 4D attention mask from remove_left_padding [batch, 1, 1, seq_len] -> [batch, seq_len]
     if attention_mask.ndim == 4:
@@ -416,10 +493,59 @@ def recover_left_padding(
 
     shape = list(result.shape)
     batch_size = shape[0]
+    seq_len_per_gpu = shape[1]
+
+    if cp_size > 1:
+        # All-gather across CP ranks to collect results from all GPUs
+        cp_group = mpu.get_context_parallel_group()
+
+        # Gather results from all CP ranks
+        gathered_results = [torch.empty_like(result) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered_results, result, group=cp_group)
+
+        # Reconstruct full sequence from chunks
+        half_seq = seq_len_per_gpu // 2
+        full_seq_len = seq_len_per_gpu * cp_size
+        chunk_size = full_seq_len // (cp_size * 2)
+
+        full_shape = list(shape)
+        full_shape[1] = full_seq_len
+        full_result = torch.zeros(dtype=result.dtype, device=result.device, size=full_shape)
+
+        for rank in range(cp_size):
+            # First chunk: restore to position chunk_size * rank
+            first_dst_start = chunk_size * rank
+            full_result[:, first_dst_start : first_dst_start + half_seq] = gathered_results[rank][:, :half_seq]
+
+            # Second chunk: restore to position (full_seq_len - chunk_size * (rank + 1))
+            second_dst_start = full_seq_len - chunk_size * (rank + 1)
+            full_result[:, second_dst_start : second_dst_start + half_seq] = gathered_results[rank][:, half_seq:]
+
+        result = full_result
+        # Update attention_mask to match full sequence
+        # For CP, we need to reconstruct full attention mask as well
+        full_attention_mask = torch.zeros(
+            dtype=attention_mask.dtype, device=attention_mask.device, size=(batch_size, full_seq_len)
+        )
+        # Gather attention masks from all ranks
+        gathered_masks = [torch.empty_like(attention_mask) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered_masks, attention_mask, group=cp_group)
+
+        for rank in range(cp_size):
+            first_dst_start = chunk_size * rank
+            full_attention_mask[:, first_dst_start : first_dst_start + half_seq] = gathered_masks[rank][:, :half_seq]
+            second_dst_start = full_seq_len - chunk_size * (rank + 1)
+            full_attention_mask[:, second_dst_start : second_dst_start + half_seq] = gathered_masks[rank][:, half_seq:]
+
+        attention_mask = full_attention_mask
+
+    # Convert back to original left-padded format
     shape[1] = origin_seqlen
     new_result = torch.zeros(dtype=result.dtype, device=result.device, size=shape)
     for i in range(batch_size):
-        new_result[i, original_attention_mask[i]] = result[i, attention_mask[i]]
+        valid_len = attention_mask[i].sum().long().item()
+        new_result[i, original_attention_mask[i]] = result[i, :valid_len]
+
     return new_result
 
 
