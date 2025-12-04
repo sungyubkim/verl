@@ -92,11 +92,12 @@ def create_test_moe_model(tmp_dir: str) -> str:
     This model has Mixture of Experts (MoE) architecture which is required
     for build_schedule_plan to be available in Megatron-Core.
     """
+    # Note: Qwen3 uses head_dim=128, so hidden_size must be num_attention_heads * 128
     config = Qwen3MoeConfig(
         num_hidden_layers=4,  # Small model for testing
-        hidden_size=256,
-        intermediate_size=512,
-        moe_intermediate_size=256,  # Size of each expert
+        hidden_size=512,  # 4 * 128 = 512 (head_dim=128 is fixed for Qwen3)
+        intermediate_size=1024,
+        moe_intermediate_size=512,  # Size of each expert
         num_attention_heads=4,
         num_key_value_heads=2,
         vocab_size=1000,
