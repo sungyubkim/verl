@@ -225,8 +225,8 @@ def test_bshd_pp_forward(
         log_probs = log_probs.masked_fill(~label_mask, 0.0)
         return {"log_probs": log_probs}
 
-    # Get model (engine.module is a list of model chunks for PP)
-    model = engine.module
+    # Get model (engine.module is a list of model chunks for PP, use [0] for non-VPP)
+    model = engine.module[0]
 
     # Run BSHD forward with PP
     try:
@@ -332,7 +332,7 @@ def test_bshd_vs_thd_comparison(
         checkpoint_config=CheckpointConfig(),
     )
     engine.initialize()
-    model = engine.module  # engine.module is a list of model chunks for PP
+    model = engine.module[0]  # engine.module is a list of model chunks for PP, use [0] for non-VPP
 
     # Create batch
     batch = create_test_batch(4, 64, model_config.hf_config.vocab_size, torch.device("cuda"))
