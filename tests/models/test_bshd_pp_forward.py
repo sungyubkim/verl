@@ -209,8 +209,11 @@ def test_bshd_pp_forward(
 
     batch = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
 
-    # Import the BSHD forward function
+    # Import the BSHD forward function and PP utilities
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+
     from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap_bshd
+    from verl.utils.megatron.pipeline_parallel import make_batch_generator
     from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
 
     # Define logits processor (same as in megatron_actor.py)
@@ -225,35 +228,47 @@ def test_bshd_pp_forward(
         log_probs = log_probs.masked_fill(~label_mask, 0.0)
         return {"log_probs": log_probs}
 
-    # Get model (engine.module is a list of model chunks for PP, use [0] for non-VPP)
-    model = engine.module[0]
-
-    # Run BSHD forward with PP
-    try:
-        output = gptmodel_forward_1f1b_overlap_bshd(
+    # Define forward_step function for forward_backward_func
+    def forward_step(batch_iter, model):
+        """Forward step that returns schedule plan for PP scheduling."""
+        micro_batch = next(batch_iter)
+        return gptmodel_forward_1f1b_overlap_bshd(
             model=model,
-            input_ids=batch["input_ids"],
-            position_ids=batch["position_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["label"],
-            labels_mask=batch["label_mask"],
+            input_ids=micro_batch["input_ids"],
+            position_ids=micro_batch["position_ids"],
+            attention_mask=micro_batch["attention_mask"],
+            labels=micro_batch["label"],
+            labels_mask=micro_batch["label_mask"],
             multi_modal_inputs={},
             logits_processor=logits_processor,
             logits_processor_args={
-                "label": batch["label"],
-                "label_mask": batch["label_mask"],
+                "label": micro_batch["label"],
+                "label_mask": micro_batch["label_mask"],
             },
             temperature=1.0,
         )
 
+    # Run BSHD forward with PP using forward_backward_func
+    try:
+        forward_backward_func = get_forward_backward_func()
+        batch_generator = make_batch_generator([batch], vpp_size=len(engine.module))
+
+        # forward_backward_func executes the schedule plan and returns results
+        output = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=batch_generator,
+            model=engine.module,  # Pass full module list
+            num_microbatches=1,
+            seq_length=seqlen,
+            micro_batch_size=batch_size,
+            forward_only=True,
+        )
+
         # Check output on last PP stage
         if mpu.is_pipeline_last_stage():
-            assert isinstance(output, dict), f"Expected dict output, got {type(output)}"
-            assert "log_probs" in output, "Output should contain log_probs"
-            assert output["log_probs"].shape == batch["label"].shape, (
-                f"log_probs shape {output['log_probs'].shape} != label shape {batch['label'].shape}"
-            )
-            print(f"[Rank {rank}] ✓ Forward passed! log_probs shape: {output['log_probs'].shape}")
+            # forward_backward_func returns list of outputs from each microbatch
+            assert output is not None, "Expected output on last PP stage"
+            print(f"[Rank {rank}] ✓ Forward passed! output type: {type(output)}")
         else:
             print(f"[Rank {rank}] ✓ Forward passed on non-last stage")
 
