@@ -73,7 +73,7 @@ def create_test_model(tmp_dir: str) -> str:
         num_key_value_heads=2,
         vocab_size=1000,
     )
-    model = AutoModelForCausalLM.from_config(config)
+    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
     path = os.path.join(tmp_dir, "test_model")
     model.save_pretrained(path)
     config.save_pretrained(path)
