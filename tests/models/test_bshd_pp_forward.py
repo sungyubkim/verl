@@ -20,8 +20,11 @@ with Pipeline Parallelism (PP > 1). The key function being tested is
 `gptmodel_forward_1f1b_overlap_bshd` which enables PP support for BSHD format.
 
 Run with:
-    # 2 GPUs - PP=2, TP=1
+    # 2 GPUs - PP=2, TP=1 (default: mbridge)
     torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test pp_only
+
+    # 2 GPUs - PP=2, TP=1 (megatron.bridge)
+    torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test pp_only --bridge megatron
 
     # 4 GPUs - PP=2, TP=2
     torchrun --nproc_per_node=4 tests/models/test_bshd_pp_forward.py --test pp_tp
@@ -31,6 +34,12 @@ Run with:
 
     # 8 GPUs - PP=2, TP=2, CP=2
     torchrun --nproc_per_node=8 tests/models/test_bshd_pp_forward.py --test all
+
+Options:
+    --test: Test configuration (pp_only, pp_tp, pp_cp, all, compare, actor)
+    --bridge: Weight loading bridge to use
+        - mbridge: Use mbridge package (vanilla_mbridge=True, default)
+        - megatron: Use megatron.bridge (vanilla_mbridge=False)
 """
 
 import argparse
@@ -126,6 +135,7 @@ def test_bshd_pp_forward(
     tp_size: int = 1,
     pp_size: int = 2,
     cp_size: int = 1,
+    vanilla_mbridge: bool = True,
 ):
     """Test BSHD forward with Pipeline Parallelism.
 
@@ -133,6 +143,12 @@ def test_bshd_pp_forward(
     1. The BSHD 1F1B forward function works correctly with PP
     2. The shape assertion (logits.shape[:2] == label.shape[:2]) passes
     3. The output log_probs have correct shape
+
+    Args:
+        tp_size: Tensor parallel size
+        pp_size: Pipeline parallel size
+        cp_size: Context parallel size
+        vanilla_mbridge: If True, use mbridge; if False, use megatron.bridge
     """
     import megatron.core.parallel_state as mpu
 
@@ -167,6 +183,7 @@ def test_bshd_pp_forward(
     engine_config = McoreEngineConfig(
         forward_only=True,  # Forward only for testing
         use_mbridge=True,
+        vanilla_mbridge=vanilla_mbridge,  # True=mbridge, False=megatron.bridge
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=cp_size,
@@ -505,32 +522,43 @@ def main():
         choices=["pp_only", "pp_tp", "pp_cp", "all", "compare", "actor"],
         help="Test configuration to run",
     )
+    parser.add_argument(
+        "--bridge",
+        type=str,
+        default="mbridge",
+        choices=["mbridge", "megatron"],
+        help="Bridge to use: 'mbridge' (vanilla_mbridge=True) or 'megatron' (vanilla_mbridge=False)",
+    )
     args = parser.parse_args()
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
 
-    print(f"[Rank {rank}] Running test: {args.test} with world_size={world_size}")
+    # Determine vanilla_mbridge setting based on --bridge argument
+    vanilla_mbridge = args.bridge == "mbridge"
+    bridge_name = "mbridge" if vanilla_mbridge else "megatron.bridge"
+
+    print(f"[Rank {rank}] Running test: {args.test} with world_size={world_size}, bridge={bridge_name}")
 
     if args.test == "pp_only":
         # PP=2, TP=1, CP=1 (requires 2 GPUs)
         assert world_size >= 2, f"Need at least 2 GPUs, got {world_size}"
-        test_bshd_pp_forward(tp_size=1, pp_size=2, cp_size=1)
+        test_bshd_pp_forward(tp_size=1, pp_size=2, cp_size=1, vanilla_mbridge=vanilla_mbridge)
 
     elif args.test == "pp_tp":
         # PP=2, TP=2, CP=1 (requires 4 GPUs)
         assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
-        test_bshd_pp_forward(tp_size=2, pp_size=2, cp_size=1)
+        test_bshd_pp_forward(tp_size=2, pp_size=2, cp_size=1, vanilla_mbridge=vanilla_mbridge)
 
     elif args.test == "pp_cp":
         # PP=2, TP=1, CP=2 (requires 4 GPUs)
         assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
-        test_bshd_pp_forward(tp_size=1, pp_size=2, cp_size=2)
+        test_bshd_pp_forward(tp_size=1, pp_size=2, cp_size=2, vanilla_mbridge=vanilla_mbridge)
 
     elif args.test == "all":
         # PP=2, TP=2, CP=2 (requires 8 GPUs)
         assert world_size >= 8, f"Need at least 8 GPUs, got {world_size}"
-        test_bshd_pp_forward(tp_size=2, pp_size=2, cp_size=2)
+        test_bshd_pp_forward(tp_size=2, pp_size=2, cp_size=2, vanilla_mbridge=vanilla_mbridge)
 
     elif args.test == "compare":
         # Compare THD vs BSHD (PP=1, requires at least 1 GPU)

@@ -222,12 +222,21 @@ class MegatronEngine(BaseEngine):
                 if self.vanilla_bridge:
                     self.bridge.load_weights(module, self.model_config.local_path)
                 else:
-                    allowed_mismatched_params = []
-                    if self.engine_config.is_value_model:
-                        allowed_mismatched_params = ["output_layer.weight"]
-                    self.bridge.load_hf_weights(
-                        module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
-                    )
+                    # Check if load_hf_weights supports allowed_mismatched_params
+                    # (compatibility with different megatron.bridge versions)
+                    import inspect
+
+                    load_hf_weights_sig = inspect.signature(self.bridge.load_hf_weights)
+                    if "allowed_mismatched_params" in load_hf_weights_sig.parameters:
+                        allowed_mismatched_params = []
+                        if self.engine_config.is_value_model:
+                            allowed_mismatched_params = ["output_layer.weight"]
+                        self.bridge.load_hf_weights(
+                            module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
+                        )
+                    else:
+                        # Older megatron.bridge version without allowed_mismatched_params support
+                        self.bridge.load_hf_weights(module, self.model_config.local_path)
             else:
                 # (vermouth1992) this is a workaround to be compatible with the old API
                 tmp_config = OmegaConf.create(
