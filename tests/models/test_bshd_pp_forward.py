@@ -711,6 +711,7 @@ def test_bshd_1f1b_overlap(
     tp_size: int = 1,
     pp_size: int = 2,
     cp_size: int = 1,
+    batch_size: int = 4,
     vanilla_mbridge: bool = True,
 ):
     """Test BSHD format with 1F1B overlap scheduling.
@@ -823,7 +824,7 @@ def test_bshd_1f1b_overlap(
         return
 
     # Create test batches (need 2 micro-batches for interleaved schedule with PP=2)
-    batch_size = 4
+    # Note: batch_size is now a parameter to test VPP batch division behavior
     seqlen = 64
     vocab_size = model_config.hf_config.vocab_size
 
@@ -1364,6 +1365,14 @@ def main():
         # This tests gptmodel_forward_1f1b_overlap_bshd with CP>1 to verify shape handling
         assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
         test_bshd_1f1b_overlap(tp_size=1, pp_size=2, cp_size=2, vanilla_mbridge=vanilla_mbridge)
+
+    elif args.test == "1f1b_overlap_vpp_small_batch":
+        # PP=2, VPP=2, batch_size=2 (requires 2 GPUs)
+        # Test VPP batch division handling: each virtual stage gets batch=1
+        # This tests the hypothesis that VPP divides batch and causes shape mismatch
+        # Expected: batch_size=2 with VPP=2 triggers batch=1 per virtual stage
+        assert world_size >= 2, f"Need at least 2 GPUs, got {world_size}"
+        test_bshd_1f1b_overlap(tp_size=1, pp_size=2, cp_size=1, batch_size=2, vanilla_mbridge=vanilla_mbridge)
 
 
 if __name__ == "__main__":
