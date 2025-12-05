@@ -917,16 +917,21 @@ def test_bshd_1f1b_overlap(
                 },
                 temperature=1.0,
             )
-            # Execute schedule plan to get tensor output
-            # Schedule plan is a computation template, must be executed via run()
+            # Execute schedule plan only on the last PP stage
+            # Non-last stages don't have post_process and run() may fail
+            # The forward_backward_func handles P2P communication between stages
             from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 
-            output_tensor = TransformerModelChunkSchedulePlan.run(
-                schedule_plan,  # Forward schedule plan
-                b_schedule_plan=None,  # No backward (forward_only mode)
-                b_grad=None,
-            )
-            return output_tensor, partial(loss_func)
+            if mpu.is_pipeline_last_stage():
+                output_tensor = TransformerModelChunkSchedulePlan.run(
+                    schedule_plan,  # Forward schedule plan
+                    b_schedule_plan=None,  # No backward (forward_only mode)
+                    b_grad=None,
+                )
+                return output_tensor, partial(loss_func)
+            else:
+                # Non-last stages return None; hidden states are sent via P2P
+                return None, partial(loss_func)
 
         forward_backward_func = get_forward_backward_func()
         # Use 2 batches for interleaved schedule (num_microbatches >= PP)
