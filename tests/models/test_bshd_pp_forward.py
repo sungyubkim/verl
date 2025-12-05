@@ -831,8 +831,17 @@ def test_bshd_1f1b_overlap(
     batch1 = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
     batch2 = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
 
-    # Define logits processor
+    # Define logits processor with debug logging for VPP batch division hypothesis
     def logits_processor(logits, label, label_mask):
+        # DEBUG: Print shapes to verify VPP batch division hypothesis
+        # Expected if hypothesis is correct:
+        #   - logits.shape[0] < label.shape[0] (e.g., 1 vs 2 or 2 vs 4)
+        print(f"[Rank {rank}] [DEBUG logits_processor] Shape comparison:")
+        print(f"  - logits.shape: {logits.shape}")
+        print(f"  - label.shape: {label.shape}")
+        print(f"  - label_mask.shape: {label_mask.shape}")
+        print(f"  - logits.shape[:2]: {logits.shape[:2]} vs label.shape[:2]: {label.shape[:2]}")
+
         assert logits.shape[:2] == label.shape[:2], (
             f"Shape mismatch: logits {logits.shape[:2]} vs label {label.shape[:2]}"
         )

@@ -377,6 +377,19 @@ def gptmodel_forward_1f1b_overlap_bshd(
                 # Transpose from [seq, batch, vocab] to [batch, seq, vocab]
                 output_orig = logits.transpose(0, 1).contiguous()
 
+                # DEBUG: Print shapes to verify VPP batch division hypothesis
+                from megatron.core import parallel_state as mpu
+                pp_rank = mpu.get_pipeline_model_parallel_rank()
+                vpp_rank = mpu.get_virtual_pipeline_model_parallel_rank() if mpu.get_virtual_pipeline_model_parallel_world_size() else 0
+                print(f"[DEBUG _postprocess_bshd] PP_rank={pp_rank}, VPP_rank={vpp_rank}")
+                print(f"  - hidden_states.shape: {hidden_states.shape}")
+                print(f"  - logits.shape (before transpose): {logits.shape}")
+                print(f"  - output_orig.shape (after transpose): {output_orig.shape}")
+                print(f"  - attention_mask_out.shape: {attention_mask_out.shape}")
+                print(f"  - position_ids.shape: {position_ids.shape}")
+                for k, v in logits_processor_args.items():
+                    print(f"  - logits_processor_args['{k}'].shape: {v.shape}")
+
                 # Convert logits_processor_args to BSHD format
                 args = {}
                 for k, v in logits_processor_args.items():
@@ -389,6 +402,11 @@ def gptmodel_forward_1f1b_overlap_bshd(
                         pre_process=True,
                     )
                     args[k] = converted.squeeze(-1)  # [batch, new_seq, 1] -> [batch, new_seq]
+
+                # DEBUG: Print converted args shapes
+                print(f"[DEBUG _postprocess_bshd] After remove_left_padding:")
+                for k, v in args.items():
+                    print(f"  - args['{k}'].shape: {v.shape}")
 
                 output_dict = logits_processor(output_orig, **args)
 
