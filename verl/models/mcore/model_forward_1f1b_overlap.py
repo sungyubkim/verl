@@ -377,46 +377,92 @@ def gptmodel_forward_1f1b_overlap_bshd(
                 # Transpose from [seq, batch, vocab] to [batch, seq, vocab]
                 output_orig = logits.transpose(0, 1).contiguous()
 
-                # DEBUG: Print shapes to verify VPP batch division hypothesis
-                from megatron.core import parallel_state as mpu
-                pp_rank = mpu.get_pipeline_model_parallel_rank()
-                vpp_rank = mpu.get_virtual_pipeline_model_parallel_rank() if mpu.get_virtual_pipeline_model_parallel_world_size() else 0
-                print(f"[DEBUG _postprocess_bshd] PP_rank={pp_rank}, VPP_rank={vpp_rank}")
-                print(f"  - hidden_states.shape: {hidden_states.shape}")
-                print(f"  - logits.shape (before transpose): {logits.shape}")
-                print(f"  - output_orig.shape (after transpose): {output_orig.shape}")
-                print(f"  - attention_mask_out.shape: {attention_mask_out.shape}")
-                print(f"  - position_ids.shape: {position_ids.shape}")
-                for k, v in logits_processor_args.items():
-                    print(f"  - logits_processor_args['{k}'].shape: {v.shape}")
+                # Handle CP: output_layer internally does CP all-gather, so output_orig has full sequence.
+                # But attention_mask_out and logits_processor_args are still CP-divided.
+                # We need to all-gather them to match the output shape.
+                cp_size = parallel_state.get_context_parallel_world_size()
 
-                # Convert logits_processor_args to BSHD format
-                args = {}
-                for k, v in logits_processor_args.items():
-                    # Use remove_left_padding for 2D tensors
-                    converted, _, _ = remove_left_padding(
-                        v.unsqueeze(-1),  # [batch, seq] -> [batch, seq, 1]
-                        attention_mask_out,
-                        position_ids,
-                        sequence_parallel=sequence_parallel,
-                        pre_process=True,
+                if cp_size > 1:
+                    cp_group = parallel_state.get_context_parallel_group()
+
+                    # All-gather attention_mask_out [batch, seq/cp] -> reconstruct [batch, seq]
+                    gathered_masks = [torch.empty_like(attention_mask_out) for _ in range(cp_size)]
+                    torch.distributed.all_gather(gathered_masks, attention_mask_out, group=cp_group)
+
+                    # CP chunk reassembly (same logic as recover_left_padding)
+                    seq_len_per_gpu = attention_mask_out.shape[1]
+                    full_seq_len = seq_len_per_gpu * cp_size
+                    half_seq = seq_len_per_gpu // 2
+                    chunk_size = full_seq_len // (cp_size * 2)
+
+                    full_attention_mask = torch.zeros(
+                        batch_size, full_seq_len, dtype=attention_mask_out.dtype, device=attention_mask_out.device
                     )
-                    args[k] = converted.squeeze(-1)  # [batch, new_seq, 1] -> [batch, new_seq]
+                    for rank in range(cp_size):
+                        first_dst = chunk_size * rank
+                        full_attention_mask[:, first_dst : first_dst + half_seq] = gathered_masks[rank][:, :half_seq]
+                        second_dst = full_seq_len - chunk_size * (rank + 1)
+                        full_attention_mask[:, second_dst : second_dst + half_seq] = gathered_masks[rank][:, half_seq:]
 
-                # DEBUG: Print converted args shapes
-                print(f"[DEBUG _postprocess_bshd] After remove_left_padding:")
-                for k, v in args.items():
-                    print(f"  - args['{k}'].shape: {v.shape}")
+                    # All-gather logits_processor_args
+                    full_args = {}
+                    for k, v in logits_processor_args.items():
+                        gathered = [torch.empty_like(v) for _ in range(cp_size)]
+                        torch.distributed.all_gather(gathered, v, group=cp_group)
 
-                output_dict = logits_processor(output_orig, **args)
+                        full_v = torch.zeros(batch_size, full_seq_len, dtype=v.dtype, device=v.device)
+                        for rank in range(cp_size):
+                            first_dst = chunk_size * rank
+                            full_v[:, first_dst : first_dst + half_seq] = gathered[rank][:, :half_seq]
+                            second_dst = full_seq_len - chunk_size * (rank + 1)
+                            full_v[:, second_dst : second_dst + half_seq] = gathered[rank][:, half_seq:]
+                        full_args[k] = full_v
 
-                # Recover to original left-padded format
-                output = {
-                    k: recover_left_padding(
-                        v, new_attention_mask_out, attention_mask_out, seq_len, post_process=True
-                    )
-                    for k, v in output_dict.items()
-                }
+                    # Convert to right-padded format (extract valid tokens)
+                    output_seq_len = output_orig.shape[1]
+                    args = {}
+                    for k, v in full_args.items():
+                        converted = torch.zeros(batch_size, output_seq_len, dtype=v.dtype, device=v.device)
+                        for i in range(batch_size):
+                            valid_mask = full_attention_mask[i].bool()
+                            valid_len = min(valid_mask.sum().item(), output_seq_len)
+                            converted[i, :valid_len] = v[i, valid_mask][:valid_len]
+                        args[k] = converted
+
+                    output_dict = logits_processor(output_orig, **args)
+
+                    # Recover to original left-padded format
+                    output = {}
+                    for k, v in output_dict.items():
+                        recovered = torch.zeros(batch_size, seq_len, dtype=v.dtype, device=v.device)
+                        for i in range(batch_size):
+                            valid_len = full_attention_mask[i].sum().long().item()
+                            orig_valid_len = min(valid_len, seq_len)
+                            # Left-padded: place valid tokens at the end
+                            recovered[i, -orig_valid_len:] = v[i, :orig_valid_len]
+                        output[k] = recovered
+                else:
+                    # CP=1: use original logic
+                    args = {}
+                    for k, v in logits_processor_args.items():
+                        converted, _, _ = remove_left_padding(
+                            v.unsqueeze(-1),  # [batch, seq] -> [batch, seq, 1]
+                            attention_mask_out,
+                            position_ids,
+                            sequence_parallel=sequence_parallel,
+                            pre_process=True,
+                        )
+                        args[k] = converted.squeeze(-1)  # [batch, new_seq, 1] -> [batch, new_seq]
+
+                    output_dict = logits_processor(output_orig, **args)
+
+                    # Recover to original left-padded format
+                    output = {
+                        k: recover_left_padding(
+                            v, new_attention_mask_out, attention_mask_out, seq_len, post_process=True
+                        )
+                        for k, v in output_dict.items()
+                    }
             else:
                 # Fused kernel path for BSHD
                 labels_converted, _, _ = remove_left_padding(
