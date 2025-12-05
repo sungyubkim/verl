@@ -50,8 +50,11 @@ Run with:
     # 2 GPUs - Test 1F1B overlap scheduling with BSHD format
     torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test 1f1b_overlap
 
+    # 2 GPUs - Test VPP batch division with model_forward_gen (forward_only=True)
+    torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test bshd_vpp_small_batch
+
 Options:
-    --test: Test configuration (basic, pp_only, pp_tp, pp_cp, all, tp_only, cp_only, compare, actor, sp_verify, 1f1b_overlap)
+    --test: Test configuration (basic, pp_only, pp_tp, pp_cp, all, tp_only, cp_only, compare, actor, sp_verify, 1f1b_overlap, bshd_vpp_small_batch)
     --bridge: Weight loading bridge to use
         - mbridge: Use mbridge package (vanilla_mbridge=True)
         - megatron: Use megatron.bridge (vanilla_mbridge=False, default)
@@ -541,6 +544,8 @@ def test_bshd_pp_forward(
     tp_size: int = 1,
     pp_size: int = 2,
     cp_size: int = 1,
+    vpp_size: int = 1,
+    batch_size: int = 4,
     vanilla_mbridge: bool = True,
 ):
     """Test BSHD forward with Pipeline Parallelism.
@@ -554,6 +559,8 @@ def test_bshd_pp_forward(
         tp_size: Tensor parallel size
         pp_size: Pipeline parallel size
         cp_size: Context parallel size
+        vpp_size: Virtual Pipeline Parallel size (default 1 = disabled)
+        batch_size: Batch size for testing (default 4)
         vanilla_mbridge: If True, use mbridge; if False, use megatron.bridge
     """
     import megatron.core.parallel_state as mpu
@@ -590,7 +597,7 @@ def test_bshd_pp_forward(
     model_path = broadcast_model_path(model_path if rank == 0 else "", rank)
     dist.barrier()
 
-    # Configure engine with PP
+    # Configure engine with PP (and optionally VPP)
     model_config = HFModelConfig(path=model_path, load_tokenizer=False)
     engine_config = McoreEngineConfig(
         forward_only=True,
@@ -598,6 +605,7 @@ def test_bshd_pp_forward(
         vanilla_mbridge=vanilla_mbridge,
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=vpp_size if vpp_size > 1 else None,
         context_parallel_size=cp_size,
     )
     optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
@@ -614,8 +622,7 @@ def test_bshd_pp_forward(
     )
     engine.initialize()
 
-    # Create test batch
-    batch_size = 4
+    # Create test batch (batch_size is now a function parameter)
     seqlen = 64
     vocab_size = model_config.hf_config.vocab_size
 
@@ -624,8 +631,17 @@ def test_bshd_pp_forward(
     # Get BSHD forward function
     bshd_forward = get_mcore_forward_fn(model_config.hf_config, use_sequence_packing=False)
 
-    # Define logits processor
+    # Define logits processor with debug logging for VPP batch division hypothesis
     def logits_processor(logits, label, label_mask):
+        # DEBUG: Print shapes to verify VPP batch division hypothesis
+        # Expected if hypothesis is correct:
+        #   - logits.shape[0] < label.shape[0] (e.g., 1 vs 2)
+        print(f"[Rank {rank}] [DEBUG logits_processor] Shape comparison:")
+        print(f"  - logits.shape: {logits.shape}")
+        print(f"  - label.shape: {label.shape}")
+        print(f"  - label_mask.shape: {label_mask.shape}")
+        print(f"  - logits.shape[:2]: {logits.shape[:2]} vs label.shape[:2]: {label.shape[:2]}")
+
         assert logits.shape[:2] == label.shape[:2], (
             f"Shape mismatch: logits {logits.shape[:2]} vs label {label.shape[:2]}"
         )
@@ -1272,7 +1288,7 @@ def main():
         "--test",
         type=str,
         default="basic",
-        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor", "sp_verify", "1f1b_overlap", "1f1b_overlap_cp"],
+        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor", "sp_verify", "1f1b_overlap", "1f1b_overlap_cp", "1f1b_overlap_vpp_small_batch", "bshd_vpp_small_batch"],
         help="Test configuration to run",
     )
     parser.add_argument(
@@ -1371,8 +1387,23 @@ def main():
         # Test VPP batch division handling: each virtual stage gets batch=1
         # This tests the hypothesis that VPP divides batch and causes shape mismatch
         # Expected: batch_size=2 with VPP=2 triggers batch=1 per virtual stage
+        # NOTE: This tests gptmodel_forward_1f1b_overlap_bshd (forward_only=False, backward path)
         assert world_size >= 2, f"Need at least 2 GPUs, got {world_size}"
         test_bshd_1f1b_overlap(tp_size=1, pp_size=2, cp_size=1, batch_size=2, vanilla_mbridge=vanilla_mbridge)
+
+    elif args.test == "bshd_vpp_small_batch":
+        # PP=2, VPP=2, batch_size=2 (requires 2 GPUs)
+        # Test model_forward_gen (forward_only=True) with VPP batch division
+        # This tests the forward_only=True path that Production uses (compute_log_prob)
+        # Expected if VPP batch division hypothesis is correct:
+        #   AssertionError: Shape mismatch: logits [1, ...] vs label [2, ...]
+        assert world_size >= 2, f"Need at least 2 GPUs, got {world_size}"
+        test_bshd_pp_forward(
+            tp_size=1, pp_size=2, cp_size=1,
+            vpp_size=2,    # VPP=2 to enable virtual pipeline
+            batch_size=2,  # Same as VPP, triggers potential batch division
+            vanilla_mbridge=vanilla_mbridge
+        )
 
 
 if __name__ == "__main__":
