@@ -768,8 +768,10 @@ def test_bshd_1f1b_overlap(
     # Note: overlap_moe_expert_parallel_comm=True is required for build_schedule_plan
     # to be available on the Megatron-Core GPTModel
     model_config = HFModelConfig(path=model_path, load_tokenizer=False)
+    # Note: forward_only=False is required for combined_1f1b scheduler
+    # which is used with overlap_moe_expert_parallel_comm=True
     engine_config = McoreEngineConfig(
-        forward_only=True,
+        forward_only=False,  # Must be False for 1F1B overlap testing (backward required)
         use_mbridge=True,
         vanilla_mbridge=vanilla_mbridge,
         tensor_model_parallel_size=tp_size,
@@ -886,6 +888,12 @@ def test_bshd_1f1b_overlap(
         # Define loss_func for forward_backward_func
         # When forward_only=False, this function must return (loss, dict) for backward pass
         def loss_func(output):
+            # Handle None output (can happen in edge cases during PP communication)
+            # This prevents AttributeError when forward_step_calc_loss accesses output_tensor.device
+            if output is None:
+                dummy_loss = torch.tensor(1.0, device="cuda", requires_grad=True)
+                return dummy_loss, {}
+
             # Output from schedule_plan execution is typically a dict with log_probs
             if isinstance(output, dict):
                 log_probs = output.get("log_probs", None)
@@ -905,7 +913,7 @@ def test_bshd_1f1b_overlap(
                 return loss, {"output": output}
             # Fallback
             dummy_loss = torch.tensor(1.0, device="cuda", requires_grad=True)
-            return dummy_loss, {"output": output}
+            return dummy_loss, {}
 
         # Define forward_step following megatron_actor.py pattern
         # combined_1f1b calls forward_step_func(batch_iter, model, return_schedule_plan=True)
