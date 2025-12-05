@@ -774,6 +774,7 @@ def test_bshd_1f1b_overlap(
         vanilla_mbridge=vanilla_mbridge,
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=2,  # Required for EP A2A overlap with PP>1
         context_parallel_size=cp_size,
         override_transformer_config={"overlap_moe_expert_parallel_comm": True},
     )
