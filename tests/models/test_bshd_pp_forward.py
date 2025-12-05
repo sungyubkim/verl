@@ -884,61 +884,82 @@ def test_bshd_1f1b_overlap(
         print(f"[Rank {rank}] Testing schedule plan execution with forward_backward_func...")
 
         # Define loss_func for forward_backward_func
-        def loss_func(output, non_loss_data=False):
-            if non_loss_data:
-                return output
-            # For schedule plan output, it's typically a tuple
-            if isinstance(output, tuple):
-                # The output from 1F1B overlap is (log_probs,)
+        # When forward_only=False, this function must return (loss, dict) for backward pass
+        def loss_func(output):
+            # Output from schedule_plan execution is typically a dict with log_probs
+            if isinstance(output, dict):
+                log_probs = output.get("log_probs", None)
+                if log_probs is not None:
+                    # Simple test loss (not actual PPO loss)
+                    loss = log_probs.mean()
+                    return loss, {"log_probs": log_probs}
+            elif isinstance(output, tuple):
+                # The output from 1F1B overlap might be (log_probs,)
                 log_probs = output[0] if len(output) > 0 else None
                 if log_probs is not None:
-                    dummy_loss = torch.tensor(1.0, device="cuda")
-                    return dummy_loss, {"log_probs": log_probs}
-            dummy_loss = torch.tensor(1.0, device="cuda")
+                    loss = log_probs.mean()
+                    return loss, {"log_probs": log_probs}
+            elif isinstance(output, torch.Tensor):
+                # Direct tensor output
+                loss = output.mean()
+                return loss, {"output": output}
+            # Fallback
+            dummy_loss = torch.tensor(1.0, device="cuda", requires_grad=True)
             return dummy_loss, {"output": output}
 
-        # Define forward_step that executes schedule_plan and returns tensor
-        def forward_step(batch_iter, model):
+        # Define forward_step following megatron_actor.py pattern
+        # combined_1f1b calls forward_step_func(batch_iter, model, return_schedule_plan=True)
+        def forward_step(batch_iter, model, return_schedule_plan: bool = False):
             micro_batch = next(batch_iter)
             # Unwrap model since forward_backward_func passes DDP-wrapped model
             unwrapped = unwrap_model(model)
-            schedule_plan = gptmodel_forward_1f1b_overlap_bshd(
-                model=unwrapped,
-                input_ids=micro_batch["input_ids"],
-                position_ids=micro_batch["position_ids"],
-                attention_mask=micro_batch["attention_mask"],
-                labels=micro_batch["label"],
-                labels_mask=micro_batch["label_mask"],
-                multi_modal_inputs={},
-                logits_processor=logits_processor,
-                logits_processor_args={
-                    "label": micro_batch["label"],
-                    "label_mask": micro_batch["label_mask"],
-                },
-                temperature=1.0,
-            )
-            # Execute schedule plan only on the last PP stage
-            # Non-last stages don't have post_process and run() may fail
-            # The forward_backward_func handles P2P communication between stages
-            from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 
-            if mpu.is_pipeline_last_stage():
-                output_tensor = TransformerModelChunkSchedulePlan.run(
-                    schedule_plan,  # Forward schedule plan
-                    b_schedule_plan=None,  # No backward (forward_only mode)
-                    b_grad=None,
+            if return_schedule_plan:
+                # 1F1B overlap path: return schedule_plan directly
+                # combined_1f1b scheduler will call run() internally
+                schedule_plan = gptmodel_forward_1f1b_overlap_bshd(
+                    model=unwrapped,
+                    input_ids=micro_batch["input_ids"],
+                    position_ids=micro_batch["position_ids"],
+                    attention_mask=micro_batch["attention_mask"],
+                    labels=micro_batch["label"],
+                    labels_mask=micro_batch["label_mask"],
+                    multi_modal_inputs={},
+                    logits_processor=logits_processor,
+                    logits_processor_args={
+                        "label": micro_batch["label"],
+                        "label_mask": micro_batch["label_mask"],
+                    },
+                    temperature=1.0,
                 )
-                return output_tensor, partial(loss_func)
+                return schedule_plan, partial(loss_func)
             else:
-                # Non-last stages return None; hidden states are sent via P2P
-                return None, partial(loss_func)
+                # Non-overlap path: use regular forward
+                # This path is used when combined_1f1b is not active
+                from verl.models.mcore import get_mcore_forward_fn
+
+                forward_fn = get_mcore_forward_fn(hf_config, use_sequence_packing=True)
+                output = forward_fn(
+                    model=unwrapped,
+                    input_ids=micro_batch["input_ids"],
+                    attention_mask=micro_batch["attention_mask"],
+                    position_ids=micro_batch["position_ids"],
+                    multi_modal_inputs={},
+                    logits_processor=logits_processor,
+                    logits_processor_args={
+                        "label": micro_batch["label"],
+                        "label_mask": micro_batch["label_mask"],
+                    },
+                )
+                return output, partial(loss_func)
 
         forward_backward_func = get_forward_backward_func()
         # Use 2 batches for interleaved schedule (num_microbatches >= PP)
         batch_generator = make_batch_generator([batch1, batch2], vpp_size=len(engine.module))
 
-        # Note: Schedule plan execution may fail if the scheduler doesn't support it
-        # This is expected behavior when overlap_moe_expert_parallel_comm is not configured
+        # With overlap_moe_expert_parallel_comm=True and forward_only=False,
+        # the scheduler automatically uses combined_1f1b which handles schedule_plan
+        # combined_1f1b will call forward_step_func(..., return_schedule_plan=True)
         output = forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=batch_generator,
@@ -946,8 +967,8 @@ def test_bshd_1f1b_overlap(
             num_microbatches=2,  # Must be >= PP for interleaved schedule
             seq_length=seqlen,
             micro_batch_size=batch_size,
-            forward_only=True,
-            collect_non_loss_data=True,
+            forward_only=False,           # False to enable combined_1f1b (1F1B overlap requires backward)
+            collect_non_loss_data=False,  # False to compute actual loss for backward
         )
 
         # Check output on last PP stage
