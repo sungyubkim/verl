@@ -775,6 +775,7 @@ def test_bshd_1f1b_overlap(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         virtual_pipeline_model_parallel_size=2,  # Required for EP A2A overlap with PP>1
+        expert_model_parallel_size=2,  # Required for overlap_moe_expert_parallel_comm
         context_parallel_size=cp_size,
         override_transformer_config={"overlap_moe_expert_parallel_comm": True},
     )
@@ -819,12 +820,14 @@ def test_bshd_1f1b_overlap(
             shutil.rmtree(tmp_dir, ignore_errors=True)
         return
 
-    # Create test batch
+    # Create test batches (need 2 micro-batches for interleaved schedule with PP=2)
     batch_size = 4
     seqlen = 64
     vocab_size = model_config.hf_config.vocab_size
 
-    batch = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
+    # Interleaved schedule requires num_microbatches >= PP
+    batch1 = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
+    batch2 = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
 
     # Define logits processor
     def logits_processor(logits, label, label_mask):
@@ -835,7 +838,7 @@ def test_bshd_1f1b_overlap(
         log_probs = log_probs.masked_fill(~label_mask, 0.0)
         return {"log_probs": log_probs}
 
-    logits_processor_args = {"label": batch["label"], "label_mask": batch["label_mask"]}
+    logits_processor_args = {"label": batch1["label"], "label_mask": batch1["label_mask"]}
 
     # Test 1: Verify gptmodel_forward_1f1b_overlap_bshd returns a schedule plan
     try:
@@ -845,11 +848,11 @@ def test_bshd_1f1b_overlap(
         # model.build_schedule_plan() which requires the raw GPTModel
         schedule_plan = gptmodel_forward_1f1b_overlap_bshd(
             model=unwrapped_model,
-            input_ids=batch["input_ids"],
-            position_ids=batch["position_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["label"],
-            labels_mask=batch["label_mask"],
+            input_ids=batch1["input_ids"],
+            position_ids=batch1["position_ids"],
+            attention_mask=batch1["attention_mask"],
+            labels=batch1["label"],
+            labels_mask=batch1["label_mask"],
             multi_modal_inputs={},
             logits_processor=logits_processor,
             logits_processor_args=logits_processor_args,
@@ -917,7 +920,8 @@ def test_bshd_1f1b_overlap(
             return schedule_plan, partial(loss_func)
 
         forward_backward_func = get_forward_backward_func()
-        batch_generator = make_batch_generator([batch], vpp_size=len(engine.module))
+        # Use 2 batches for interleaved schedule (num_microbatches >= PP)
+        batch_generator = make_batch_generator([batch1, batch2], vpp_size=len(engine.module))
 
         # Note: Schedule plan execution may fail if the scheduler doesn't support it
         # This is expected behavior when overlap_moe_expert_parallel_comm is not configured
@@ -925,7 +929,7 @@ def test_bshd_1f1b_overlap(
             forward_step_func=forward_step,
             data_iterator=batch_generator,
             model=engine.module,
-            num_microbatches=1,
+            num_microbatches=2,  # Must be >= PP for interleaved schedule
             seq_length=seqlen,
             micro_batch_size=batch_size,
             forward_only=True,
