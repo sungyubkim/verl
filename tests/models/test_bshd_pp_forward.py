@@ -792,10 +792,17 @@ def test_bshd_1f1b_overlap(
     engine.initialize()
 
     # Get model and check if build_schedule_plan is available
-    model = engine.module[0]
+    # Note: engine.module[0] is wrapped in DDP and Float16Module, so we need to
+    # unwrap to access GPTModel's build_schedule_plan method
+    from verl.utils.megatron_utils import unwrap_model
 
-    # Check if model supports build_schedule_plan
-    has_schedule_plan = hasattr(model, "build_schedule_plan") and callable(getattr(model, "build_schedule_plan", None))
+    model = engine.module[0]
+    unwrapped_model = unwrap_model(model)
+
+    # Check if model supports build_schedule_plan (check on unwrapped model)
+    has_schedule_plan = hasattr(unwrapped_model, "build_schedule_plan") and callable(
+        getattr(unwrapped_model, "build_schedule_plan", None)
+    )
     print(f"[Rank {rank}] Model supports build_schedule_plan: {has_schedule_plan}")
 
     if not has_schedule_plan:
@@ -833,8 +840,10 @@ def test_bshd_1f1b_overlap(
     try:
         print(f"[Rank {rank}] Testing gptmodel_forward_1f1b_overlap_bshd...")
 
+        # Use unwrapped_model since gptmodel_forward_1f1b_overlap_bshd calls
+        # model.build_schedule_plan() which requires the raw GPTModel
         schedule_plan = gptmodel_forward_1f1b_overlap_bshd(
-            model=model,
+            model=unwrapped_model,
             input_ids=batch["input_ids"],
             position_ids=batch["position_ids"],
             attention_mask=batch["attention_mask"],
@@ -887,8 +896,10 @@ def test_bshd_1f1b_overlap(
         # Define forward_step that returns schedule_plan
         def forward_step(batch_iter, model):
             micro_batch = next(batch_iter)
+            # Unwrap model since forward_backward_func passes DDP-wrapped model
+            unwrapped = unwrap_model(model)
             schedule_plan = gptmodel_forward_1f1b_overlap_bshd(
-                model=model,
+                model=unwrapped,
                 input_ids=micro_batch["input_ids"],
                 position_ids=micro_batch["position_ids"],
                 attention_mask=micro_batch["attention_mask"],
