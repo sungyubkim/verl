@@ -897,7 +897,7 @@ def test_bshd_1f1b_overlap(
             dummy_loss = torch.tensor(1.0, device="cuda")
             return dummy_loss, {"output": output}
 
-        # Define forward_step that returns schedule_plan
+        # Define forward_step that executes schedule_plan and returns tensor
         def forward_step(batch_iter, model):
             micro_batch = next(batch_iter)
             # Unwrap model since forward_backward_func passes DDP-wrapped model
@@ -917,7 +917,16 @@ def test_bshd_1f1b_overlap(
                 },
                 temperature=1.0,
             )
-            return schedule_plan, partial(loss_func)
+            # Execute schedule plan to get tensor output
+            # Schedule plan is a computation template, must be executed via run()
+            from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
+
+            output_tensor = TransformerModelChunkSchedulePlan.run(
+                schedule_plan,  # Forward schedule plan
+                b_schedule_plan=None,  # No backward (forward_only mode)
+                b_grad=None,
+            )
+            return output_tensor, partial(loss_func)
 
         forward_backward_func = get_forward_backward_func()
         # Use 2 batches for interleaved schedule (num_microbatches >= PP)
