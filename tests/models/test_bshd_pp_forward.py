@@ -1271,7 +1271,7 @@ def main():
         "--test",
         type=str,
         default="basic",
-        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor", "sp_verify", "1f1b_overlap"],
+        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor", "sp_verify", "1f1b_overlap", "1f1b_overlap_cp"],
         help="Test configuration to run",
     )
     parser.add_argument(
@@ -1357,6 +1357,13 @@ def main():
         # This tests gptmodel_forward_1f1b_overlap_bshd which returns TransformerModelChunkSchedulePlan
         assert world_size >= 2, f"Need at least 2 GPUs, got {world_size}"
         test_bshd_1f1b_overlap(tp_size=1, pp_size=2, cp_size=1, vanilla_mbridge=vanilla_mbridge)
+
+    elif args.test == "1f1b_overlap_cp":
+        # PP=2, TP=1, CP=2 (requires 4 GPUs)
+        # Test BSHD with 1F1B overlap scheduling + Context Parallelism
+        # This tests gptmodel_forward_1f1b_overlap_bshd with CP>1 to verify shape handling
+        assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
+        test_bshd_1f1b_overlap(tp_size=1, pp_size=2, cp_size=2, vanilla_mbridge=vanilla_mbridge)
 
 
 if __name__ == "__main__":
