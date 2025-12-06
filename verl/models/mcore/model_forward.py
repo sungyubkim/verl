@@ -140,12 +140,22 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 **model_kwargs,
             )
 
-            # DEBUG: model 호출 전 input shape 확인
-            print(f"[DEBUG model_forward_gen] Before model() call:")
+            # DEBUG: PP stage 정보 및 input shape 확인
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+
+            # Stage 타입 결정
+            if pre_process and post_process:
+                stage_type = "SINGLE"
+            elif pre_process:
+                stage_type = "FIRST"
+            elif post_process:
+                stage_type = "LAST"
+            else:
+                stage_type = "MIDDLE"
+
+            print(f"[DEBUG model_forward_gen] PP_RANK={pp_rank}/{pp_size} VPP={vpp_size} STAGE={stage_type}")
             print(f"  model type: {type(model).__name__}")
-            print(f"  pre_process: {pre_process}, post_process: {post_process}")
-            print(f"  pp_size: {pp_size}")
-            print(f"  vpp_size: {mpu.get_virtual_pipeline_model_parallel_world_size()}")
             print(f"  input_ids.shape: {input_args['input_ids'].shape}")
             print(f"  attention_mask.shape: {input_args['attention_mask'].shape if input_args.get('attention_mask') is not None else 'None'}")
             print(f"  position_ids.shape: {input_args['position_ids'].shape if input_args.get('position_ids') is not None else 'None'}")
@@ -153,18 +163,20 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
             output_orig = model(**input_args)
 
             # DEBUG: model 호출 후 output shape 확인
-            print(f"[DEBUG model_forward_gen] After model() call:")
+            print(f"[DEBUG model_forward_gen] PP_RANK={pp_rank} STAGE={stage_type} After model():")
             print(f"  output_orig.shape: {output_orig.shape}")
-            print(f"  output_orig.device: {output_orig.device}")
-            print(f"  batch_size (from attention_mask): {batch_size}")
-            if logits_processor_args:
-                for k, v in logits_processor_args.items():
-                    print(f"  logits_processor_args['{k}']: {v.shape}")
-            # Check if batch mismatch detected
-            if output_orig.shape[0] != batch_size:
+            print(f"  batch_size (from attention_mask): {batch_size}, seq_len: {seq_len}")
+            # Check if batch mismatch detected (only meaningful for LAST stage)
+            if post_process and output_orig.shape[0] != batch_size:
                 print(f"  ⚠️ BATCH MISMATCH DETECTED: output batch={output_orig.shape[0]} vs input batch={batch_size}")
 
             if post_process and logits_processor is not None:
+                # DEBUG: LAST stage - logits_processor 실행 전 shape 확인
+                print(f"[DEBUG model_forward_gen] PP_RANK={pp_rank} STAGE=LAST - logits_processor 실행")
+                print(f"  output_orig.shape (logits): {output_orig.shape}")
+                for k, v in logits_processor_args.items():
+                    print(f"  logits_processor_args['{k}']: {v.shape}")
+
                 # For non-packing path, convert logits_processor_args to right-padded format
                 # to match output_orig shape (which was processed by remove_left_padding)
                 #
@@ -199,6 +211,11 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                         converted = converted[:, :output_seq_len]
 
                     args[k] = converted
+
+                # DEBUG: 변환 후 args shape 확인
+                for k, v in args.items():
+                    print(f"  args['{k}'] (converted): {v.shape}")
+
                 output_dict = logits_processor(output_orig, **args)
 
                 # Defensive padding for new_attention_mask: should not be needed with fixed_seq_len,
