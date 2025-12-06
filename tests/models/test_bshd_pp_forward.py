@@ -733,7 +733,7 @@ def test_bshd_pp_vpp_forward(
     vpp_size: int = 2,
     batch_size: int = 2,
     num_microbatches: int = 2,
-    vanilla_mbridge: bool = True,
+    vanilla_mbridge: bool = False,  # Use megatron.bridge to match Production
 ):
     """Test BSHD forward (model_forward_gen) with Virtual Pipeline Parallelism.
 
@@ -751,7 +751,7 @@ def test_bshd_pp_vpp_forward(
         vpp_size: Virtual Pipeline Parallel size (must be > 1)
         batch_size: Batch size per micro-batch
         num_microbatches: Number of micro-batches (must be >= PP for interleaved schedule)
-        vanilla_mbridge: If True, use mbridge; if False, use megatron.bridge
+        vanilla_mbridge: If True, use mbridge; if False, use megatron.bridge (Production default)
     """
     import megatron.core.parallel_state as mpu
     from functools import partial
@@ -794,11 +794,15 @@ def test_bshd_pp_vpp_forward(
     dist.barrier()
 
     # Configure engine with PP + VPP
+    # IMPORTANT: use_sequence_packing=False is critical for BSHD format.
+    # This sets variable_seq_lengths=False in Megatron-Core, which can trigger
+    # batch-to-sequence flattening in PP communication.
     model_config = HFModelConfig(path=model_path, load_tokenizer=False)
     engine_config = McoreEngineConfig(
         forward_only=True,  # Production compute_log_prob path
         use_mbridge=True,
         vanilla_mbridge=vanilla_mbridge,
+        use_sequence_packing=False,  # BSHD format - sets variable_seq_lengths=False
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         virtual_pipeline_model_parallel_size=vpp_size,  # VPP enabled
