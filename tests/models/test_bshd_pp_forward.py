@@ -819,7 +819,11 @@ def test_bshd_pp_vpp_forward(
     engine.initialize()
 
     # Create multiple test batches for interleaved schedule
-    seqlen = 64
+    # Use large seqlen to reproduce Production batch-flatten behavior.
+    # Production uses seqlen=24576, which triggers Megatron-Core PP scheduler
+    # to reshape [batch, seq, hidden] -> [1, batch*seq, hidden].
+    # With small seqlen (64), this optimization doesn't trigger.
+    seqlen = 4096
     vocab_size = model_config.hf_config.vocab_size
 
     batches = [
