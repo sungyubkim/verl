@@ -417,46 +417,31 @@ def gptmodel_forward_1f1b_overlap_bshd(
                       f"CP_RANK={parallel_state.get_context_parallel_rank()}", flush=True)
 
                 if cp_size > 1:
-                    cp_group = parallel_state.get_context_parallel_group()
+                    # CP>1: attention_mask_out and logits_processor_args are already full sequence.
+                    # Megatron-Core handles CP internally:
+                    # 1. Input: full sequence passed to GPTModel
+                    # 2. GPTModel internally divides sequence by CP rank (chunk interleaving)
+                    # 3. output_layer does CP all-gather and returns full sequence
+                    # Therefore, NO external CP processing needed here!
 
-                    # DEBUG: CP all-gather 전
-                    print(f"[DEBUG _postprocess_bshd] BEFORE CP all-gather, "
-                          f"attention_mask_out.shape={attention_mask_out.shape}", flush=True)
-
-                    # All-gather attention_mask_out [batch, seq/cp] -> reconstruct [batch, seq]
-                    gathered_masks = [torch.empty_like(attention_mask_out) for _ in range(cp_size)]
-                    torch.distributed.all_gather(gathered_masks, attention_mask_out, group=cp_group)
-
-                    # DEBUG: CP all-gather 후
-                    print(f"[DEBUG _postprocess_bshd] AFTER CP all-gather (attention_mask)", flush=True)
-
-                    # CP chunk reassembly (same logic as recover_left_padding)
-                    seq_len_per_gpu = attention_mask_out.shape[1]
-                    full_seq_len = seq_len_per_gpu * cp_size
-                    half_seq = seq_len_per_gpu // 2
-                    chunk_size = full_seq_len // (cp_size * 2)
-
-                    full_attention_mask = torch.zeros(
-                        batch_size, full_seq_len, dtype=attention_mask_out.dtype, device=attention_mask_out.device
-                    )
-                    for rank in range(cp_size):
-                        first_dst = chunk_size * rank
-                        full_attention_mask[:, first_dst : first_dst + half_seq] = gathered_masks[rank][:, :half_seq]
-                        second_dst = full_seq_len - chunk_size * (rank + 1)
-                        full_attention_mask[:, second_dst : second_dst + half_seq] = gathered_masks[rank][:, half_seq:]
-
-                    # DO NOT all-gather logits_processor_args - keep CP-divided to match output_orig
-                    # output_orig is CP-divided (seq_per_gpu), so args must also be CP-divided
-                    output_seq_len = output_orig.shape[1]  # Already batch*seq_per_gpu if flattened
-                    args = {}
+                    output_seq_len = output_orig.shape[1]
 
                     # Detect batch flattening: batch dimension is 1 but original batch_size > 1
                     is_batch_flattened = (output_orig.shape[0] == 1 and batch_size > 1)
 
-                    for k, v in logits_processor_args.items():  # v: [batch, seq_per_gpu]
+                    # DEBUG: CP>1 path (simplified)
+                    print(f"[DEBUG _postprocess_bshd] CP>1 path (simplified), "
+                          f"PP_RANK={parallel_state.get_pipeline_model_parallel_rank()}, "
+                          f"CP_RANK={parallel_state.get_context_parallel_rank()}, "
+                          f"attention_mask_out.shape={attention_mask_out.shape}, "
+                          f"output_orig.shape={output_orig.shape}, "
+                          f"is_batch_flattened={is_batch_flattened}", flush=True)
+
+                    # Process logits_processor_args: already full sequence, just handle batch flatten
+                    args = {}
+                    for k, v in logits_processor_args.items():  # v: [batch, full_seq]
                         if is_batch_flattened:
-                            # output_seq_len is already batch*seq_per_gpu
-                            # Just flatten v directly: [batch, seq_per_gpu] -> [1, batch*seq_per_gpu]
+                            # [batch, seq] -> [1, batch*seq]
                             converted = v.reshape(1, -1)
                             # Truncate/pad to match output_seq_len if needed
                             if converted.shape[1] > output_seq_len:
@@ -468,25 +453,30 @@ def gptmodel_forward_1f1b_overlap_bshd(
                                 )
                                 converted = torch.cat([converted, padding], dim=1)
                         else:
-                            # Convert to right-padded format using CP-divided attention_mask
-                            converted = torch.zeros(batch_size, output_seq_len, dtype=v.dtype, device=v.device)
-                            for i in range(batch_size):
-                                valid_mask = attention_mask_out[i].bool()  # CP-divided mask
-                                valid_len = min(valid_mask.sum().item(), output_seq_len)
-                                converted[i, :valid_len] = v[i, valid_mask][:valid_len]
-
+                            # Already full seq, just ensure shape matches output_seq_len
+                            if v.shape[1] > output_seq_len:
+                                converted = v[:, :output_seq_len]
+                            elif v.shape[1] < output_seq_len:
+                                padding = torch.zeros(
+                                    batch_size, output_seq_len - v.shape[1],
+                                    dtype=v.dtype, device=v.device
+                                )
+                                converted = torch.cat([v, padding], dim=1)
+                            else:
+                                converted = v
                         args[k] = converted
 
                     # DEBUG: logits_processor 전 (CP>1)
                     print(f"[DEBUG _postprocess_bshd] BEFORE logits_processor (CP>1), "
-                          f"output_orig.shape={output_orig.shape}", flush=True)
+                          f"output_orig.shape={output_orig.shape}, "
+                          f"args shapes: {{{', '.join(f'{k}: {v.shape}' for k, v in args.items())}}}", flush=True)
 
                     output_dict = logits_processor(output_orig, **args)
 
                     # DEBUG: logits_processor 후 (CP>1)
                     print(f"[DEBUG _postprocess_bshd] AFTER logits_processor (CP>1)", flush=True)
 
-                    # Unflatten and recover to original left-padded format
+                    # Unflatten if batch was flattened
                     if is_batch_flattened:
                         output = {k: v.reshape(batch_size, -1) for k, v in output_dict.items()}
                     else:
@@ -495,7 +485,7 @@ def gptmodel_forward_1f1b_overlap_bshd(
                         for k, v in output_dict.items():
                             recovered = torch.zeros(batch_size, seq_len, dtype=v.dtype, device=v.device)
                             for i in range(batch_size):
-                                valid_len = full_attention_mask[i].sum().long().item()
+                                valid_len = attention_mask_out[i].sum().long().item()
                                 orig_valid_len = min(valid_len, seq_len)
                                 # Left-padded: place valid tokens at the end
                                 recovered[i, -orig_valid_len:] = v[i, :orig_valid_len]
