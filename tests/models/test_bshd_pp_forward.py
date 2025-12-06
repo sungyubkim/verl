@@ -122,12 +122,22 @@ def create_test_batch(
     seqlen: int,
     vocab_size: int,
     device: torch.device,
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ):
-    """Create a test batch with random data and left-padded attention masks."""
+    """Create a test batch with random data and left-padded attention masks.
+
+    When cp_size > 1, creates CP-divided data matching Production behavior.
+    Each CP rank gets a different portion of the sequence, following Megatron-Core's
+    CP chunk interleaving pattern:
+    - Rank 0: chunks [0] and [-1] (first and last)
+    - Rank 1: chunks [1] and [-2], etc.
+    """
     from verl.utils.model import compute_position_id_with_mask, create_random_mask
 
     torch.manual_seed(42)
 
+    # Create full-sequence data first
     input_ids = torch.randint(0, vocab_size, (batch_size, seqlen), device=device)
     attention_mask = create_random_mask(
         input_ids=input_ids,
@@ -148,6 +158,31 @@ def create_test_batch(
     label_mask = attention_mask.clone()
     label_mask[:, : -response_length - 1] = False
     label_mask[:, -1] = False
+
+    # Apply CP division if cp_size > 1
+    if cp_size > 1:
+        # Megatron-Core CP chunk pattern: each rank gets first half and last half
+        # from different positions in the sequence
+        seq_per_gpu = seqlen // cp_size
+        half_seq = seq_per_gpu // 2
+        chunk_size = seqlen // (cp_size * 2)
+
+        def cp_divide_tensor(tensor):
+            """Extract CP-divided portion for this rank."""
+            # First half: from position chunk_size * cp_rank
+            first_start = chunk_size * cp_rank
+            first_chunk = tensor[:, first_start:first_start + half_seq]
+            # Second half: from position seqlen - chunk_size * (cp_rank + 1)
+            second_start = seqlen - chunk_size * (cp_rank + 1)
+            second_chunk = tensor[:, second_start:second_start + half_seq]
+            return torch.cat([first_chunk, second_chunk], dim=1)
+
+        input_ids = cp_divide_tensor(input_ids)
+        attention_mask = cp_divide_tensor(attention_mask)
+        position_ids = cp_divide_tensor(position_ids)
+        label = cp_divide_tensor(label)
+        label_mask = cp_divide_tensor(label_mask)
+        responses = cp_divide_tensor(responses)
 
     return {
         "input_ids": input_ids,
@@ -1290,9 +1325,13 @@ def test_bshd_1f1b_overlap(
     seqlen = 64
     vocab_size = model_config.hf_config.vocab_size
 
+    # Get CP rank for CP-divided batch creation (matches Production data loading)
+    cp_rank = mpu.get_context_parallel_rank() if cp_size > 1 else 0
+
     # Interleaved schedule requires num_microbatches >= PP
-    batch1 = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
-    batch2 = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
+    # When cp_size > 1, create CP-divided batches to match Production behavior
+    batch1 = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"), cp_size=cp_size, cp_rank=cp_rank)
+    batch2 = create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"), cp_size=cp_size, cp_rank=cp_rank)
 
     # Define logits processor with debug logging for VPP batch division hypothesis
     def logits_processor(logits, label, label_mask):
