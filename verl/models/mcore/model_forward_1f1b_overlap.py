@@ -447,23 +447,33 @@ def gptmodel_forward_1f1b_overlap_bshd(
 
                     # DO NOT all-gather logits_processor_args - keep CP-divided to match output_orig
                     # output_orig is CP-divided (seq_per_gpu), so args must also be CP-divided
-                    output_seq_len = output_orig.shape[1]  # seq_per_gpu (CP-divided)
+                    output_seq_len = output_orig.shape[1]  # Already batch*seq_per_gpu if flattened
                     args = {}
 
                     # Detect batch flattening: batch dimension is 1 but original batch_size > 1
                     is_batch_flattened = (output_orig.shape[0] == 1 and batch_size > 1)
 
                     for k, v in logits_processor_args.items():  # v: [batch, seq_per_gpu]
-                        # Convert to right-padded format using CP-divided attention_mask
-                        converted = torch.zeros(batch_size, output_seq_len, dtype=v.dtype, device=v.device)
-                        for i in range(batch_size):
-                            valid_mask = attention_mask_out[i].bool()  # CP-divided mask
-                            valid_len = min(valid_mask.sum().item(), output_seq_len)
-                            converted[i, :valid_len] = v[i, valid_mask][:valid_len]
-
-                        # Handle batch flattening: [batch, seq] -> [1, batch*seq]
                         if is_batch_flattened:
-                            converted = converted.reshape(1, -1)
+                            # output_seq_len is already batch*seq_per_gpu
+                            # Just flatten v directly: [batch, seq_per_gpu] -> [1, batch*seq_per_gpu]
+                            converted = v.reshape(1, -1)
+                            # Truncate/pad to match output_seq_len if needed
+                            if converted.shape[1] > output_seq_len:
+                                converted = converted[:, :output_seq_len]
+                            elif converted.shape[1] < output_seq_len:
+                                padding = torch.zeros(
+                                    1, output_seq_len - converted.shape[1],
+                                    dtype=v.dtype, device=v.device
+                                )
+                                converted = torch.cat([converted, padding], dim=1)
+                        else:
+                            # Convert to right-padded format using CP-divided attention_mask
+                            converted = torch.zeros(batch_size, output_seq_len, dtype=v.dtype, device=v.device)
+                            for i in range(batch_size):
+                                valid_mask = attention_mask_out[i].bool()  # CP-divided mask
+                                valid_len = min(valid_mask.sum().item(), output_seq_len)
+                                converted[i, :valid_len] = v[i, valid_mask][:valid_len]
 
                         args[k] = converted
 
