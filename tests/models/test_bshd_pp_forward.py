@@ -1778,7 +1778,7 @@ def main():
         "--test",
         type=str,
         default="basic",
-        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor", "sp_verify", "1f1b_overlap", "1f1b_overlap_cp", "1f1b_overlap_vpp_small_batch", "bshd_vpp_small_batch", "bshd_vpp_ep_small_batch"],
+        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor", "sp_verify", "1f1b_overlap", "1f1b_overlap_cp", "1f1b_overlap_vpp_cp", "1f1b_overlap_vpp_small_batch", "bshd_vpp_small_batch", "bshd_vpp_ep_small_batch"],
         help="Test configuration to run",
     )
     parser.add_argument(
@@ -1871,6 +1871,14 @@ def main():
         # This tests gptmodel_forward_1f1b_overlap_bshd with CP>1 to verify shape handling
         assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
         test_bshd_1f1b_overlap(tp_size=1, pp_size=2, cp_size=2, vanilla_mbridge=vanilla_mbridge)
+
+    elif args.test == "1f1b_overlap_vpp_cp":
+        # PP=2, VPP=2, CP=2, batch_size=4 (requires 4 GPUs)
+        # Test VPP + CP combination to verify is_batch_flattened=False path with CP>1
+        # This is important because Production uses VPP=2 with micro_batch_size=2
+        # When micro_batch_size>1, is_batch_flattened=False, so this path needs testing
+        assert world_size >= 4, f"Need at least 4 GPUs, got {world_size}"
+        test_bshd_1f1b_overlap(tp_size=1, pp_size=2, cp_size=2, batch_size=4, vanilla_mbridge=vanilla_mbridge)
 
     elif args.test == "1f1b_overlap_vpp_small_batch":
         # PP=2, VPP=2, batch_size=2 (requires 2 GPUs)
