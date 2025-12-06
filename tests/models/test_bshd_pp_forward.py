@@ -237,6 +237,7 @@ def test_bshd_forward(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,  # PP=1 for direct forward
         context_parallel_size=cp_size,
+        use_sequence_packing=False,  # BSHD format - sets variable_seq_lengths=False
     )
     optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
     checkpoint_config = CheckpointConfig()
@@ -386,6 +387,7 @@ def test_sp_verification(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=cp_size,
+        use_sequence_packing=False,  # BSHD format - sets variable_seq_lengths=False
     )
     optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
     checkpoint_config = CheckpointConfig()
@@ -1239,6 +1241,7 @@ def test_bshd_1f1b_overlap(
         virtual_pipeline_model_parallel_size=2,  # Required for EP A2A overlap with PP>1
         expert_model_parallel_size=2,  # Required for overlap_moe_expert_parallel_comm
         context_parallel_size=cp_size,
+        use_sequence_packing=False,  # BSHD format - sets variable_seq_lengths=False
         override_transformer_config={"overlap_moe_expert_parallel_comm": True},
     )
     optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
