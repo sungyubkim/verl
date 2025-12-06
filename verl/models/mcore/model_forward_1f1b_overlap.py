@@ -462,12 +462,21 @@ def gptmodel_forward_1f1b_overlap_bshd(
                     # Convert to right-padded format (extract valid tokens)
                     output_seq_len = output_orig.shape[1]
                     args = {}
+
+                    # Detect batch flattening: batch dimension is 1 but original batch_size > 1
+                    is_batch_flattened = (output_orig.shape[0] == 1 and batch_size > 1)
+
                     for k, v in full_args.items():
                         converted = torch.zeros(batch_size, output_seq_len, dtype=v.dtype, device=v.device)
                         for i in range(batch_size):
                             valid_mask = full_attention_mask[i].bool()
                             valid_len = min(valid_mask.sum().item(), output_seq_len)
                             converted[i, :valid_len] = v[i, valid_mask][:valid_len]
+
+                        # Handle batch flattening: [batch, seq] -> [1, batch*seq]
+                        if is_batch_flattened:
+                            converted = converted.reshape(1, -1)
+
                         args[k] = converted
 
                     # DEBUG: logits_processor 전 (CP>1)
@@ -479,16 +488,20 @@ def gptmodel_forward_1f1b_overlap_bshd(
                     # DEBUG: logits_processor 후 (CP>1)
                     print(f"[DEBUG _postprocess_bshd] AFTER logits_processor (CP>1)", flush=True)
 
-                    # Recover to original left-padded format
-                    output = {}
-                    for k, v in output_dict.items():
-                        recovered = torch.zeros(batch_size, seq_len, dtype=v.dtype, device=v.device)
-                        for i in range(batch_size):
-                            valid_len = full_attention_mask[i].sum().long().item()
-                            orig_valid_len = min(valid_len, seq_len)
-                            # Left-padded: place valid tokens at the end
-                            recovered[i, -orig_valid_len:] = v[i, :orig_valid_len]
-                        output[k] = recovered
+                    # Unflatten and recover to original left-padded format
+                    if is_batch_flattened:
+                        output = {k: v.reshape(batch_size, -1) for k, v in output_dict.items()}
+                    else:
+                        # Recover to original left-padded format
+                        output = {}
+                        for k, v in output_dict.items():
+                            recovered = torch.zeros(batch_size, seq_len, dtype=v.dtype, device=v.device)
+                            for i in range(batch_size):
+                                valid_len = full_attention_mask[i].sum().long().item()
+                                orig_valid_len = min(valid_len, seq_len)
+                                # Left-padded: place valid tokens at the end
+                                recovered[i, -orig_valid_len:] = v[i, :orig_valid_len]
+                            output[k] = recovered
                 else:
                     # CP=1: use original logic
                     args = {}
