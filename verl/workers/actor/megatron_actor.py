@@ -536,6 +536,12 @@ class MegatronPPOActor(BasePPOActor):
             batch = batch.to(get_device_id())
             batch = batch.contiguous()
 
+            # DEBUG: batch shape 확인 (Production shape mismatch 디버깅용)
+            print(f"[DEBUG forward_step] batch shapes:")
+            for k, v in batch.items():
+                if hasattr(v, 'shape'):
+                    print(f"  {k}: {v.shape}")
+
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"].to(bool)
             position_ids = batch["position_ids"]

@@ -141,6 +141,17 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
             )
 
             output_orig = model(**input_args)
+
+            # DEBUG: shape 비교 (Production shape mismatch 디버깅용)
+            if post_process and logits_processor is not None:
+                print(f"[DEBUG model_forward_gen] BSHD path shape check:")
+                print(f"  batch_size (from attention_mask): {batch_size}")
+                print(f"  output_orig.shape: {output_orig.shape}")
+                print(f"  attention_mask.shape: {attention_mask.shape}")
+                if logits_processor_args:
+                    for k, v in logits_processor_args.items():
+                        print(f"  logits_processor_args['{k}']: {v.shape}")
+
             if post_process and logits_processor is not None:
                 # For non-packing path, convert logits_processor_args to right-padded format
                 # to match output_orig shape (which was processed by remove_left_padding)
