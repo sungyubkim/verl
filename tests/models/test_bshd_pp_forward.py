@@ -886,13 +886,18 @@ def test_bshd_pp_vpp_forward(
 
         # NOTE: Using collect_non_loss_data=False and micro_batch_size=1 to match
         # Production behavior (megatron_actor.py forward_backward_batch L657-665).
-        # This tests whether collect_non_loss_data=False causes batch division issue.
+        #
+        # CRITICAL: Production uses seq_length = micro_batch_size * seq_len (L405),
+        # which triggers Megatron-Core PP scheduler to reshape tensors from
+        # [batch, seq, hidden] to [1, batch*seq, hidden].
+        # We must replicate this to reproduce the batch-flatten issue.
+        total_seqlen = batch_size * seqlen  # Match Production: micro_batch_size * seq_len
         output = forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=batch_generator,
             model=engine.module,
             num_microbatches=num_microbatches,  # Multiple micro-batches for interleaved schedule
-            seq_length=seqlen,
+            seq_length=total_seqlen,  # Production uses batch_size * seqlen
             micro_batch_size=1,  # Production uses 1
             forward_only=True,
             # collect_non_loss_data defaults to False (same as Production)
