@@ -140,17 +140,29 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 **model_kwargs,
             )
 
+            # DEBUG: model 호출 전 input shape 확인
+            print(f"[DEBUG model_forward_gen] Before model() call:")
+            print(f"  model type: {type(model).__name__}")
+            print(f"  pre_process: {pre_process}, post_process: {post_process}")
+            print(f"  pp_size: {pp_size}")
+            print(f"  vpp_size: {mpu.get_virtual_pipeline_model_parallel_world_size()}")
+            print(f"  input_ids.shape: {input_args['input_ids'].shape}")
+            print(f"  attention_mask.shape: {input_args['attention_mask'].shape if input_args.get('attention_mask') is not None else 'None'}")
+            print(f"  position_ids.shape: {input_args['position_ids'].shape if input_args.get('position_ids') is not None else 'None'}")
+
             output_orig = model(**input_args)
 
-            # DEBUG: shape 비교 (Production shape mismatch 디버깅용)
-            if post_process and logits_processor is not None:
-                print(f"[DEBUG model_forward_gen] BSHD path shape check:")
-                print(f"  batch_size (from attention_mask): {batch_size}")
-                print(f"  output_orig.shape: {output_orig.shape}")
-                print(f"  attention_mask.shape: {attention_mask.shape}")
-                if logits_processor_args:
-                    for k, v in logits_processor_args.items():
-                        print(f"  logits_processor_args['{k}']: {v.shape}")
+            # DEBUG: model 호출 후 output shape 확인
+            print(f"[DEBUG model_forward_gen] After model() call:")
+            print(f"  output_orig.shape: {output_orig.shape}")
+            print(f"  output_orig.device: {output_orig.device}")
+            print(f"  batch_size (from attention_mask): {batch_size}")
+            if logits_processor_args:
+                for k, v in logits_processor_args.items():
+                    print(f"  logits_processor_args['{k}']: {v.shape}")
+            # Check if batch mismatch detected
+            if output_orig.shape[0] != batch_size:
+                print(f"  ⚠️ BATCH MISMATCH DETECTED: output batch={output_orig.shape[0]} vs input batch={batch_size}")
 
             if post_process and logits_processor is not None:
                 # For non-packing path, convert logits_processor_args to right-padded format
