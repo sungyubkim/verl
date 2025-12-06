@@ -291,6 +291,17 @@ def gptmodel_forward_1f1b_overlap_bshd(
 
     batch_size, seq_len = attention_mask.shape[:2]
 
+    # DEBUG: 함수 진입
+    from megatron.core import parallel_state
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    cp_size = parallel_state.get_context_parallel_world_size()
+    print(f"[DEBUG 1f1b_bshd] ENTER, "
+          f"PP_RANK={pp_rank}/{pp_size}, CP_RANK={cp_rank}/{cp_size}, "
+          f"pre_process={pre_process}, post_process={post_process}, "
+          f"batch_size={batch_size}, seq_len={seq_len}", flush=True)
+
     # BSHD conversion: use remove_left_padding instead of preprocess_packed_seqs
     new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
         input_ids,
@@ -302,6 +313,11 @@ def gptmodel_forward_1f1b_overlap_bshd(
     if pre_process:
         new_input_ids = new_input_ids.contiguous()
 
+    # DEBUG: build_schedule_plan 전
+    print(f"[DEBUG 1f1b_bshd] BEFORE build_schedule_plan, "
+          f"PP_RANK={pp_rank}, "
+          f"new_input_ids.shape={new_input_ids.shape if pre_process else 'N/A'}", flush=True)
+
     # Build PP schedule plan with BSHD format (packed_seq_params=None)
     schedule_plan = model.build_schedule_plan(
         input_ids=new_input_ids,
@@ -310,6 +326,10 @@ def gptmodel_forward_1f1b_overlap_bshd(
         position_ids=new_position_ids,
         packed_seq_params=None,  # BSHD doesn't use packed sequences
     )
+
+    # DEBUG: build_schedule_plan 후
+    print(f"[DEBUG 1f1b_bshd] AFTER build_schedule_plan, "
+          f"PP_RANK={pp_rank}, schedule_plan type={type(schedule_plan).__name__}", flush=True)
 
     if post_process:
         # Store original masks for recovery
@@ -371,23 +391,44 @@ def gptmodel_forward_1f1b_overlap_bshd(
 
             # Process with logits_processor (BSHD path supports this)
             if logits_processor is not None:
+                # DEBUG: _postprocess_bshd 진입
+                print(f"[DEBUG _postprocess_bshd] ENTER logits_processor path, "
+                      f"PP_RANK={parallel_state.get_pipeline_model_parallel_rank()}, "
+                      f"hidden_states.shape={hidden_states.shape}", flush=True)
+
                 logits, _ = self.output_layer(
                     hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
                 )
                 # Transpose from [seq, batch, vocab] to [batch, seq, vocab]
                 output_orig = logits.transpose(0, 1).contiguous()
 
+                # DEBUG: output_layer 완료
+                print(f"[DEBUG _postprocess_bshd] AFTER output_layer, "
+                      f"PP_RANK={parallel_state.get_pipeline_model_parallel_rank()}, "
+                      f"output_orig.shape={output_orig.shape}", flush=True)
+
                 # Handle CP: output_layer internally does CP all-gather, so output_orig has full sequence.
                 # But attention_mask_out and logits_processor_args are still CP-divided.
                 # We need to all-gather them to match the output shape.
                 cp_size = parallel_state.get_context_parallel_world_size()
 
+                # DEBUG: CP size 확인
+                print(f"[DEBUG _postprocess_bshd] CP_SIZE={cp_size}, "
+                      f"CP_RANK={parallel_state.get_context_parallel_rank()}", flush=True)
+
                 if cp_size > 1:
                     cp_group = parallel_state.get_context_parallel_group()
+
+                    # DEBUG: CP all-gather 전
+                    print(f"[DEBUG _postprocess_bshd] BEFORE CP all-gather, "
+                          f"attention_mask_out.shape={attention_mask_out.shape}", flush=True)
 
                     # All-gather attention_mask_out [batch, seq/cp] -> reconstruct [batch, seq]
                     gathered_masks = [torch.empty_like(attention_mask_out) for _ in range(cp_size)]
                     torch.distributed.all_gather(gathered_masks, attention_mask_out, group=cp_group)
+
+                    # DEBUG: CP all-gather 후
+                    print(f"[DEBUG _postprocess_bshd] AFTER CP all-gather (attention_mask)", flush=True)
 
                     # CP chunk reassembly (same logic as recover_left_padding)
                     seq_len_per_gpu = attention_mask_out.shape[1]
@@ -429,7 +470,14 @@ def gptmodel_forward_1f1b_overlap_bshd(
                             converted[i, :valid_len] = v[i, valid_mask][:valid_len]
                         args[k] = converted
 
+                    # DEBUG: logits_processor 전 (CP>1)
+                    print(f"[DEBUG _postprocess_bshd] BEFORE logits_processor (CP>1), "
+                          f"output_orig.shape={output_orig.shape}", flush=True)
+
                     output_dict = logits_processor(output_orig, **args)
+
+                    # DEBUG: logits_processor 후 (CP>1)
+                    print(f"[DEBUG _postprocess_bshd] AFTER logits_processor (CP>1)", flush=True)
 
                     # Recover to original left-padded format
                     output = {}
@@ -454,7 +502,14 @@ def gptmodel_forward_1f1b_overlap_bshd(
                         )
                         args[k] = converted.squeeze(-1)  # [batch, new_seq, 1] -> [batch, new_seq]
 
+                    # DEBUG: logits_processor 전 (CP=1)
+                    print(f"[DEBUG _postprocess_bshd] BEFORE logits_processor (CP=1), "
+                          f"output_orig.shape={output_orig.shape}", flush=True)
+
                     output_dict = logits_processor(output_orig, **args)
+
+                    # DEBUG: logits_processor 후 (CP=1)
+                    print(f"[DEBUG _postprocess_bshd] AFTER logits_processor (CP=1)", flush=True)
 
                     # Recover to original left-padded format
                     output = {

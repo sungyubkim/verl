@@ -113,6 +113,14 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
             # (e.g., learnable softmax in TransformerEngine)
             sequence_parallel = unwrap_model(model).config.sequence_parallel
             pp_size = mpu.get_pipeline_model_parallel_world_size()
+            cp_size_init = mpu.get_context_parallel_world_size()
+
+            # DEBUG: CP=2 hang 디버깅
+            print(f"[DEBUG model_forward BSHD] "
+                  f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}/{pp_size}, "
+                  f"CP_RANK={mpu.get_context_parallel_rank()}/{cp_size_init}, "
+                  f"pre_process={pre_process}, post_process={post_process}, "
+                  f"batch_size={batch_size}, seq_len={seq_len}", flush=True)
 
             # For PP>1, use fixed sequence length to ensure consistent P2P buffer shapes.
             # Without this, remove_left_padding computes seq_len dynamically per micro-batch,
@@ -140,7 +148,17 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 **model_kwargs,
             )
 
+            # DEBUG: model forward 전
+            print(f"[DEBUG model_forward] Before model(), "
+                  f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
+                  f"input_ids.shape={new_input_ids.shape if pre_process else 'N/A'}", flush=True)
+
             output_orig = model(**input_args)
+
+            # DEBUG: model forward 후
+            print(f"[DEBUG model_forward] After model(), "
+                  f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
+                  f"output_orig.shape={output_orig.shape if post_process else 'hidden'}", flush=True)
 
             if post_process and logits_processor is not None:
                 # Detect batch flattening from Megatron-Core PP scheduler.
@@ -156,13 +174,29 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 # We need to all-gather them to match the output shape.
                 cp_size = mpu.get_context_parallel_world_size()
 
+                # DEBUG: CP size 확인
+                print(f"[DEBUG model_forward] post_process path, "
+                      f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
+                      f"CP_SIZE={cp_size}, is_batch_flattened={is_batch_flattened}", flush=True)
+
                 if cp_size > 1:
                     import torch.distributed
                     cp_group = mpu.get_context_parallel_group()
 
+                    # DEBUG: CP all-gather 전
+                    print(f"[DEBUG model_forward] BEFORE CP all-gather, "
+                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
+                          f"CP_RANK={mpu.get_context_parallel_rank()}, "
+                          f"attention_mask.shape={attention_mask.shape}", flush=True)
+
                     # All-gather attention_mask [batch, seq/cp] -> reconstruct [batch, seq]
                     gathered_masks = [torch.empty_like(attention_mask) for _ in range(cp_size)]
                     torch.distributed.all_gather(gathered_masks, attention_mask, group=cp_group)
+
+                    # DEBUG: CP all-gather 후
+                    print(f"[DEBUG model_forward] AFTER CP all-gather (attention_mask), "
+                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
+                          f"CP_RANK={mpu.get_context_parallel_rank()}", flush=True)
 
                     # CP chunk reassembly (same logic as _postprocess_bshd)
                     seq_len_per_gpu = attention_mask.shape[1]
@@ -208,7 +242,16 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
                         args[k] = converted
 
+                    # DEBUG: logits_processor 전 (CP>1)
+                    print(f"[DEBUG model_forward] BEFORE logits_processor (CP>1), "
+                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
+                          f"output_orig.shape={output_orig.shape}", flush=True)
+
                     output_dict = logits_processor(output_orig, **args)
+
+                    # DEBUG: logits_processor 후 (CP>1)
+                    print(f"[DEBUG model_forward] AFTER logits_processor (CP>1), "
+                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}", flush=True)
 
                     # Unflatten and recover to original left-padded format
                     if is_batch_flattened:
@@ -257,7 +300,16 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
                         args[k] = converted
 
+                    # DEBUG: logits_processor 전 (CP=1)
+                    print(f"[DEBUG model_forward] BEFORE logits_processor (CP=1), "
+                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
+                          f"output_orig.shape={output_orig.shape}", flush=True)
+
                     output_dict = logits_processor(output_orig, **args)
+
+                    # DEBUG: logits_processor 후 (CP=1)
+                    print(f"[DEBUG model_forward] AFTER logits_processor (CP=1), "
+                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}", flush=True)
 
                     # Unflatten results if batch was flattened
                     if is_batch_flattened:
