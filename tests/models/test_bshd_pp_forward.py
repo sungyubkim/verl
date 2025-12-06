@@ -880,28 +880,38 @@ def test_bshd_pp_vpp_forward(
         print(f"[Rank {rank}] Running with PP={pp_size}, VPP={vpp_size}, "
               f"batch_size={batch_size}, num_microbatches={num_microbatches}")
 
+        # NOTE: Using collect_non_loss_data=False and micro_batch_size=1 to match
+        # Production behavior (megatron_actor.py forward_backward_batch L657-665).
+        # This tests whether collect_non_loss_data=False causes batch division issue.
         output = forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=batch_generator,
             model=engine.module,
             num_microbatches=num_microbatches,  # Multiple micro-batches for interleaved schedule
             seq_length=seqlen,
-            micro_batch_size=batch_size,
+            micro_batch_size=1,  # Production uses 1
             forward_only=True,
-            collect_non_loss_data=True,
+            # collect_non_loss_data defaults to False (same as Production)
         )
 
         # Check output on last PP stage
+        # With collect_non_loss_data=False, output format is different:
+        # - losses_reduced is a list of (loss, {stats_dict}) tuples
         if mpu.is_pipeline_last_stage():
             assert output is not None, "Expected output on last PP stage"
-            # output is a list of (output_dict,) tuples from each microbatch
+            # With collect_non_loss_data=False, output is list of (loss, stats) from loss_func
             assert len(output) == num_microbatches, (
                 f"Expected {num_microbatches} microbatch outputs, got {len(output)}"
             )
-            output_dict = output[0]
+            # Extract output from loss_func return value
+            loss_stats = output[0]
+            if isinstance(loss_stats, tuple) and len(loss_stats) >= 2:
+                output_dict = loss_stats[1].get("output", loss_stats[1])
+            else:
+                output_dict = loss_stats
             if isinstance(output_dict, tuple):
                 output_dict = output_dict[0]
-            assert "log_probs" in output_dict, "Expected 'log_probs' in output"
+            assert "log_probs" in output_dict, f"Expected 'log_probs' in output, got {output_dict.keys() if isinstance(output_dict, dict) else type(output_dict)}"
             log_probs = output_dict["log_probs"]
             print(f"[Rank {rank}] ✓ PP+VPP forward passed! log_probs shape: {log_probs.shape}")
         else:
