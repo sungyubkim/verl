@@ -53,8 +53,11 @@ Run with:
     # 2 GPUs - Test VPP batch division with model_forward_gen (forward_only=True)
     torchrun --nproc_per_node=2 tests/models/test_bshd_pp_forward.py --test bshd_vpp_small_batch
 
+    # 4 GPUs - Test VPP + EP batch division (reproduces Production issue)
+    torchrun --nproc_per_node=4 tests/models/test_bshd_pp_forward.py --test bshd_vpp_ep_small_batch
+
 Options:
-    --test: Test configuration (basic, pp_only, pp_tp, pp_cp, all, tp_only, cp_only, compare, actor, sp_verify, 1f1b_overlap, bshd_vpp_small_batch)
+    --test: Test configuration (basic, pp_only, pp_tp, pp_cp, all, tp_only, cp_only, compare, actor, sp_verify, 1f1b_overlap, bshd_vpp_small_batch, bshd_vpp_ep_small_batch)
     --bridge: Weight loading bridge to use
         - mbridge: Use mbridge package (vanilla_mbridge=True)
         - megatron: Use megatron.bridge (vanilla_mbridge=False, default)
@@ -924,6 +927,212 @@ def test_bshd_pp_vpp_forward(
     print(f"[Rank {rank}] PP+VPP test completed successfully!")
 
 
+def test_bshd_pp_vpp_ep_forward(
+    tp_size: int = 1,
+    pp_size: int = 2,
+    cp_size: int = 1,
+    vpp_size: int = 2,
+    ep_size: int = 2,
+    batch_size: int = 2,
+    num_microbatches: int = 2,
+    vanilla_mbridge: bool = True,
+):
+    """Test BSHD forward (model_forward_gen) with VPP + EP to reproduce Production issue.
+
+    This test uses MoE model with Expert Parallelism to reproduce the batch division
+    issue observed in Production environment (TP=1/PP=2/VPP=2/EP=8/CP=1).
+
+    In Production, the model() call internally divides the batch, causing:
+    - output_orig.shape[0] = 1 (divided)
+    - attention_mask.shape[0] = 2 (original)
+    - logits_processor_args shape[0] = 2 (original)
+
+    This leads to AssertionError: Shape mismatch: logits [1, ...] vs label [2, ...]
+
+    Args:
+        tp_size: Tensor parallel size
+        pp_size: Pipeline parallel size
+        cp_size: Context parallel size
+        vpp_size: Virtual Pipeline Parallel size (must be > 1)
+        ep_size: Expert Parallel size (must be > 1 for MoE)
+        batch_size: Batch size per micro-batch
+        num_microbatches: Number of micro-batches (must be >= PP for interleaved schedule)
+        vanilla_mbridge: If True, use mbridge; if False, use megatron.bridge
+    """
+    import megatron.core.parallel_state as mpu
+    from functools import partial
+
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+
+    from verl.models.mcore import get_mcore_forward_fn
+    from verl.trainer.config import CheckpointConfig
+    from verl.utils.megatron.pipeline_parallel import make_batch_generator
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+    from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
+    from verl.workers.engine import EngineRegistry
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    torch.cuda.set_device(local_rank)
+
+    # Validate VPP and EP requirements
+    assert vpp_size > 1, f"VPP size must be > 1, got {vpp_size}"
+    assert ep_size > 1, f"EP size must be > 1, got {ep_size}"
+    assert num_microbatches >= pp_size, (
+        f"num_microbatches ({num_microbatches}) must be >= pp_size ({pp_size}) for interleaved schedule"
+    )
+
+    # Initialize distributed
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    # Create MoE test model (required for EP)
+    tmp_dir = tempfile.mkdtemp(prefix="verl_test_bshd_pp_vpp_ep_")
+    if rank == 0:
+        model_path = create_test_moe_model(tmp_dir)  # Use MoE model for EP
+        print(f"[Rank {rank}] Created MoE test model at: {model_path}")
+    else:
+        model_path = ""
+
+    dist.barrier()
+    model_path = broadcast_model_path(model_path if rank == 0 else "", rank)
+    dist.barrier()
+
+    # Configure engine with PP + VPP + EP
+    model_config = HFModelConfig(path=model_path, load_tokenizer=False)
+    engine_config = McoreEngineConfig(
+        forward_only=True,  # Production compute_log_prob path
+        use_mbridge=True,
+        vanilla_mbridge=vanilla_mbridge,
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=vpp_size,  # VPP enabled
+        expert_model_parallel_size=ep_size,  # EP enabled (requires MoE model)
+        context_parallel_size=cp_size,
+    )
+    optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
+    checkpoint_config = CheckpointConfig()
+
+    # Build engine
+    engine = EngineRegistry.new(
+        model_type="language_model",
+        backend="megatron",
+        model_config=model_config,
+        engine_config=engine_config,
+        optimizer_config=optimizer_config,
+        checkpoint_config=checkpoint_config,
+    )
+    engine.initialize()
+
+    # Create multiple test batches for interleaved schedule
+    seqlen = 64
+    vocab_size = model_config.hf_config.vocab_size
+
+    batches = [
+        create_test_batch(batch_size, seqlen, vocab_size, torch.device("cuda"))
+        for _ in range(num_microbatches)
+    ]
+
+    # Get BSHD forward function (model_forward_gen with use_sequence_packing=False)
+    bshd_forward = get_mcore_forward_fn(model_config.hf_config, use_sequence_packing=False)
+
+    # Define logits processor with debug logging for EP batch division hypothesis
+    def logits_processor(logits, label, label_mask):
+        # DEBUG: Print shapes to verify EP batch division hypothesis
+        print(f"[Rank {rank}] [DEBUG logits_processor] Shape comparison:")
+        print(f"  - logits.shape: {logits.shape}")
+        print(f"  - label.shape: {label.shape}")
+        print(f"  - label_mask.shape: {label_mask.shape}")
+        print(f"  - logits.shape[:2]: {logits.shape[:2]} vs label.shape[:2]: {label.shape[:2]}")
+
+        assert logits.shape[:2] == label.shape[:2], (
+            f"Shape mismatch: logits {logits.shape[:2]} vs label {label.shape[:2]}"
+        )
+        log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+        log_probs = log_probs.masked_fill(~label_mask, 0.0)
+        return {"log_probs": log_probs}
+
+    # Define loss_func for forward_backward_func
+    def loss_func(output, non_loss_data=False):
+        if non_loss_data:
+            return output
+        dummy_loss = torch.tensor(1.0, device="cuda")
+        return dummy_loss, {"output": output}
+
+    # Define forward_step function for forward_backward_func
+    def forward_step(batch_iter, model):
+        micro_batch = next(batch_iter)
+        output = bshd_forward(
+            model=model,
+            input_ids=micro_batch["input_ids"],
+            attention_mask=micro_batch["attention_mask"],
+            position_ids=micro_batch["position_ids"],
+            multi_modal_inputs={},
+            logits_processor=logits_processor,
+            logits_processor_args={
+                "label": micro_batch["label"],
+                "label_mask": micro_batch["label_mask"],
+            },
+        )
+        return output, partial(loss_func)
+
+    # Run BSHD forward with PP + VPP + EP
+    try:
+        forward_backward_func = get_forward_backward_func()
+        batch_generator = make_batch_generator(batches, vpp_size=len(engine.module))
+
+        print(f"[Rank {rank}] Running with PP={pp_size}, VPP={vpp_size}, EP={ep_size}, "
+              f"batch_size={batch_size}, num_microbatches={num_microbatches}")
+
+        output = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=batch_generator,
+            model=engine.module,
+            num_microbatches=num_microbatches,  # Multiple micro-batches for interleaved schedule
+            seq_length=seqlen,
+            micro_batch_size=batch_size,
+            forward_only=True,
+            collect_non_loss_data=True,
+        )
+
+        # Check output on last PP stage
+        if mpu.is_pipeline_last_stage():
+            assert output is not None, "Expected output on last PP stage"
+            # output is a list of (output_dict,) tuples from each microbatch
+            assert len(output) == num_microbatches, (
+                f"Expected {num_microbatches} microbatch outputs, got {len(output)}"
+            )
+            output_dict = output[0]
+            if isinstance(output_dict, tuple):
+                output_dict = output_dict[0]
+            assert "log_probs" in output_dict, "Expected 'log_probs' in output"
+            log_probs = output_dict["log_probs"]
+            print(f"[Rank {rank}] ✓ PP+VPP+EP forward passed! log_probs shape: {log_probs.shape}")
+        else:
+            print(f"[Rank {rank}] ✓ PP+VPP+EP forward passed on non-last stage")
+
+    except AssertionError as e:
+        print(f"[Rank {rank}] ✗ FAILED: {e}")
+        raise
+    except Exception as e:
+        print(f"[Rank {rank}] ✗ ERROR: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+    # Cleanup
+    dist.barrier()
+    mpu.destroy_model_parallel()
+    dist.destroy_process_group()
+
+    if rank == 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    print(f"[Rank {rank}] PP+VPP+EP test completed successfully!")
+
+
 def test_bshd_1f1b_overlap(
     tp_size: int = 1,
     pp_size: int = 2,
@@ -1489,7 +1698,7 @@ def main():
         "--test",
         type=str,
         default="basic",
-        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor", "sp_verify", "1f1b_overlap", "1f1b_overlap_cp", "1f1b_overlap_vpp_small_batch", "bshd_vpp_small_batch"],
+        choices=["basic", "pp_only", "pp_tp", "pp_cp", "all", "tp_only", "cp_only", "compare", "actor", "sp_verify", "1f1b_overlap", "1f1b_overlap_cp", "1f1b_overlap_vpp_small_batch", "bshd_vpp_small_batch", "bshd_vpp_ep_small_batch"],
         help="Test configuration to run",
     )
     parser.add_argument(
@@ -1603,6 +1812,22 @@ def main():
         test_bshd_pp_vpp_forward(
             tp_size=1, pp_size=2, cp_size=1,
             vpp_size=2,           # VPP=2 to enable virtual pipeline
+            batch_size=2,         # Batch size per micro-batch
+            num_microbatches=2,   # >= PP for interleaved schedule
+            vanilla_mbridge=vanilla_mbridge
+        )
+
+    elif args.test == "bshd_vpp_ep_small_batch":
+        # PP=2, VPP=2, EP=2, batch_size=2, num_microbatches=2 (requires 4 GPUs: PP*EP=4)
+        # Test model_forward_gen (forward_only=True) with VPP + EP
+        # This uses MoE model with Expert Parallelism to reproduce Production issue
+        # Production environment: TP=1/PP=2/VPP=2/EP=8/CP=1, micro_batch_size=2
+        # Expected: AssertionError: Shape mismatch: logits [1, ...] vs label [2, ...]
+        assert world_size >= 4, f"Need at least 4 GPUs for PP=2*EP=2, got {world_size}"
+        test_bshd_pp_vpp_ep_forward(
+            tp_size=1, pp_size=2, cp_size=1,
+            vpp_size=2,           # VPP=2 to enable virtual pipeline
+            ep_size=2,            # EP=2 to enable expert parallelism (requires MoE model)
             batch_size=2,         # Batch size per micro-batch
             num_microbatches=2,   # >= PP for interleaved schedule
             vanilla_mbridge=vanilla_mbridge
