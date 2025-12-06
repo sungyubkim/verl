@@ -1440,13 +1440,18 @@ def test_bshd_1f1b_overlap(
         # With overlap_moe_expert_parallel_comm=True and forward_only=False,
         # the scheduler automatically uses combined_1f1b which handles schedule_plan
         # combined_1f1b will call forward_step_func(..., return_schedule_plan=True)
+        # Use Production-like parameters to reproduce batch flattening behavior:
+        # - micro_batch_size=1: Tell PP scheduler to flatten batch into sequence
+        # - seq_length=batch_size*seqlen: Total sequence length after flatten
+        # This matches megatron_actor.py L657-665 which uses micro_batch_size=1
+        # and seq_length=total_seqlen (micro_batch_size * seq_len)
         output = forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=batch_generator,
             model=engine.module,
             num_microbatches=2,  # Must be >= PP for interleaved schedule
-            seq_length=seqlen,
-            micro_batch_size=batch_size,
+            seq_length=batch_size * seqlen,  # Production: batch flattened into sequence
+            micro_batch_size=1,              # Production: triggers batch flatten in PP scheduler
             forward_only=False,           # False to enable combined_1f1b (1F1B overlap requires backward)
             collect_non_loss_data=False,  # False to compute actual loss for backward
         )
