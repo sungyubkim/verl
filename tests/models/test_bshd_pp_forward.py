@@ -904,13 +904,23 @@ def test_bshd_pp_vpp_forward(
                 f"Expected {num_microbatches} microbatch outputs, got {len(output)}"
             )
             # Extract output from loss_func return value
+            # With collect_non_loss_data=False, format is: [(loss, {"output": {...}}), ...]
             loss_stats = output[0]
+            print(f"[DEBUG] loss_stats type: {type(loss_stats)}, value: {loss_stats}")
             if isinstance(loss_stats, tuple) and len(loss_stats) >= 2:
-                output_dict = loss_stats[1].get("output", loss_stats[1])
+                stats_dict = loss_stats[1]
+                # stats_dict is {"output": {"log_probs": ...}}
+                if isinstance(stats_dict, dict) and "output" in stats_dict:
+                    output_dict = stats_dict["output"]
+                else:
+                    output_dict = stats_dict
             else:
                 output_dict = loss_stats
             if isinstance(output_dict, tuple):
                 output_dict = output_dict[0]
+            # Handle nested {"output": ...} if present
+            if isinstance(output_dict, dict) and "output" in output_dict and "log_probs" not in output_dict:
+                output_dict = output_dict["output"]
             assert "log_probs" in output_dict, f"Expected 'log_probs' in output, got {output_dict.keys() if isinstance(output_dict, dict) else type(output_dict)}"
             log_probs = output_dict["log_probs"]
             print(f"[Rank {rank}] ✓ PP+VPP forward passed! log_probs shape: {log_probs.shape}")
