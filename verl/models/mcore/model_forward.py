@@ -213,26 +213,14 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                         second_dst = full_seq_len - chunk_size * (rank + 1)
                         full_attention_mask[:, second_dst : second_dst + half_seq] = gathered_masks[rank][:, half_seq:]
 
-                    # All-gather logits_processor_args with same chunk reassembly
-                    full_args = {}
-                    for k, v in logits_processor_args.items():
-                        gathered = [torch.empty_like(v) for _ in range(cp_size)]
-                        torch.distributed.all_gather(gathered, v, group=cp_group)
-
-                        full_v = torch.zeros(batch_size, full_seq_len, dtype=v.dtype, device=v.device)
-                        for rank in range(cp_size):
-                            first_dst = chunk_size * rank
-                            full_v[:, first_dst : first_dst + half_seq] = gathered[rank][:, :half_seq]
-                            second_dst = full_seq_len - chunk_size * (rank + 1)
-                            full_v[:, second_dst : second_dst + half_seq] = gathered[rank][:, half_seq:]
-                        full_args[k] = full_v
-
-                    # Convert to right-padded format (extract valid tokens)
+                    # DO NOT all-gather logits_processor_args - keep CP-divided to match output_orig
+                    # output_orig is CP-divided (seq_per_gpu), so args must also be CP-divided
                     args = {}
-                    for k, v in full_args.items():
+                    for k, v in logits_processor_args.items():  # v: [batch, seq_per_gpu]
+                        # Convert to right-padded format using CP-divided attention_mask
                         converted = torch.zeros(batch_size, output_seq_len, dtype=v.dtype, device=v.device)
                         for i in range(batch_size):
-                            valid_mask = full_attention_mask[i].bool()
+                            valid_mask = attention_mask[i].bool()  # CP-divided mask
                             valid_len = min(valid_mask.sum().item(), output_seq_len)
                             converted[i, :valid_len] = v[i, valid_mask][:valid_len]
 
