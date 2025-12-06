@@ -151,63 +151,138 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 output_seq_len = output_orig.shape[1]
                 is_batch_flattened = (output_batch == 1 and batch_size > 1)
 
-                args = {}
-                for k, v in logits_processor_args.items():
-                    # Use remove_left_padding for 2D tensors by adding/removing a dimension
-                    converted, _, _ = remove_left_padding(
-                        v.unsqueeze(-1),  # [batch, seq_len] -> [batch, seq_len, 1]
-                        attention_mask,
-                        position_ids,
-                        sequence_parallel=sequence_parallel,
-                        pre_process=True,
-                        fixed_seq_len=fixed_seq_len,  # Use same fixed_seq_len for consistency
+                # Handle CP: output_layer does CP all-gather internally, so output_orig has full sequence.
+                # But attention_mask and logits_processor_args are still CP-divided.
+                # We need to all-gather them to match the output shape.
+                cp_size = mpu.get_context_parallel_world_size()
+
+                if cp_size > 1:
+                    import torch.distributed
+                    cp_group = mpu.get_context_parallel_group()
+
+                    # All-gather attention_mask [batch, seq/cp] -> reconstruct [batch, seq]
+                    gathered_masks = [torch.empty_like(attention_mask) for _ in range(cp_size)]
+                    torch.distributed.all_gather(gathered_masks, attention_mask, group=cp_group)
+
+                    # CP chunk reassembly (same logic as _postprocess_bshd)
+                    seq_len_per_gpu = attention_mask.shape[1]
+                    full_seq_len = seq_len_per_gpu * cp_size
+                    half_seq = seq_len_per_gpu // 2
+                    chunk_size = full_seq_len // (cp_size * 2)
+
+                    full_attention_mask = torch.zeros(
+                        batch_size, full_seq_len, dtype=attention_mask.dtype, device=attention_mask.device
                     )
-                    converted = converted.squeeze(-1)  # [batch, new_seq_len, 1] -> [batch, new_seq_len]
+                    for rank in range(cp_size):
+                        first_dst = chunk_size * rank
+                        full_attention_mask[:, first_dst : first_dst + half_seq] = gathered_masks[rank][:, :half_seq]
+                        second_dst = full_seq_len - chunk_size * (rank + 1)
+                        full_attention_mask[:, second_dst : second_dst + half_seq] = gathered_masks[rank][:, half_seq:]
 
-                    # Handle batch flattening: [batch, seq] -> [1, batch*seq]
+                    # All-gather logits_processor_args with same chunk reassembly
+                    full_args = {}
+                    for k, v in logits_processor_args.items():
+                        gathered = [torch.empty_like(v) for _ in range(cp_size)]
+                        torch.distributed.all_gather(gathered, v, group=cp_group)
+
+                        full_v = torch.zeros(batch_size, full_seq_len, dtype=v.dtype, device=v.device)
+                        for rank in range(cp_size):
+                            first_dst = chunk_size * rank
+                            full_v[:, first_dst : first_dst + half_seq] = gathered[rank][:, :half_seq]
+                            second_dst = full_seq_len - chunk_size * (rank + 1)
+                            full_v[:, second_dst : second_dst + half_seq] = gathered[rank][:, half_seq:]
+                        full_args[k] = full_v
+
+                    # Convert to right-padded format (extract valid tokens)
+                    args = {}
+                    for k, v in full_args.items():
+                        converted = torch.zeros(batch_size, output_seq_len, dtype=v.dtype, device=v.device)
+                        for i in range(batch_size):
+                            valid_mask = full_attention_mask[i].bool()
+                            valid_len = min(valid_mask.sum().item(), output_seq_len)
+                            converted[i, :valid_len] = v[i, valid_mask][:valid_len]
+
+                        # Handle batch flattening
+                        if is_batch_flattened:
+                            converted = converted.reshape(1, -1)
+
+                        args[k] = converted
+
+                    output_dict = logits_processor(output_orig, **args)
+
+                    # Unflatten and recover to original left-padded format
                     if is_batch_flattened:
-                        converted = converted.reshape(1, -1)
-
-                    # Defensive padding/truncation for seq_len mismatch
-                    if converted.shape[1] < output_seq_len:
-                        padding = torch.zeros(
-                            converted.shape[0],
-                            output_seq_len - converted.shape[1],
-                            dtype=converted.dtype,
-                            device=converted.device,
-                        )
-                        converted = torch.cat([converted, padding], dim=1)
-                    elif converted.shape[1] > output_seq_len:
-                        converted = converted[:, :output_seq_len]
-
-                    args[k] = converted
-
-                output_dict = logits_processor(output_orig, **args)
-
-                # Unflatten results if batch was flattened
-                if is_batch_flattened:
-                    # [1, batch*seq] -> [batch, seq]
-                    # Note: seq_len is the original sequence length from attention_mask
-                    output = {k: v.reshape(batch_size, -1) for k, v in output_dict.items()}
-                else:
-                    # Normal path: recover left padding
-                    # Defensive padding for new_attention_mask
-                    if new_attention_mask.shape[-1] < output_seq_len:
-                        padding_shape = list(new_attention_mask.shape)
-                        padding_shape[-1] = output_seq_len - new_attention_mask.shape[-1]
-                        mask_padding = torch.zeros(
-                            padding_shape,
-                            dtype=new_attention_mask.dtype,
-                            device=new_attention_mask.device,
-                        )
-                        new_attention_mask_padded = torch.cat([new_attention_mask, mask_padding], dim=-1)
+                        output = {k: v.reshape(batch_size, -1) for k, v in output_dict.items()}
                     else:
-                        new_attention_mask_padded = new_attention_mask
+                        # Recover to original left-padded format
+                        output = {}
+                        for k, v in output_dict.items():
+                            recovered = torch.zeros(batch_size, seq_len, dtype=v.dtype, device=v.device)
+                            for i in range(batch_size):
+                                valid_len = full_attention_mask[i].sum().long().item()
+                                orig_valid_len = min(valid_len, seq_len)
+                                # Left-padded: place valid tokens at the end
+                                recovered[i, -orig_valid_len:] = v[i, :orig_valid_len]
+                            output[k] = recovered
+                else:
+                    # CP=1: use original logic
+                    args = {}
+                    for k, v in logits_processor_args.items():
+                        # Use remove_left_padding for 2D tensors by adding/removing a dimension
+                        converted, _, _ = remove_left_padding(
+                            v.unsqueeze(-1),  # [batch, seq_len] -> [batch, seq_len, 1]
+                            attention_mask,
+                            position_ids,
+                            sequence_parallel=sequence_parallel,
+                            pre_process=True,
+                            fixed_seq_len=fixed_seq_len,  # Use same fixed_seq_len for consistency
+                        )
+                        converted = converted.squeeze(-1)  # [batch, new_seq_len, 1] -> [batch, new_seq_len]
 
-                    output = {
-                        k: recover_left_padding(v, new_attention_mask_padded, attention_mask, seq_len, post_process=post_process)
-                        for k, v in output_dict.items()
-                    }
+                        # Handle batch flattening: [batch, seq] -> [1, batch*seq]
+                        if is_batch_flattened:
+                            converted = converted.reshape(1, -1)
+
+                        # Defensive padding/truncation for seq_len mismatch
+                        if converted.shape[1] < output_seq_len:
+                            padding = torch.zeros(
+                                converted.shape[0],
+                                output_seq_len - converted.shape[1],
+                                dtype=converted.dtype,
+                                device=converted.device,
+                            )
+                            converted = torch.cat([converted, padding], dim=1)
+                        elif converted.shape[1] > output_seq_len:
+                            converted = converted[:, :output_seq_len]
+
+                        args[k] = converted
+
+                    output_dict = logits_processor(output_orig, **args)
+
+                    # Unflatten results if batch was flattened
+                    if is_batch_flattened:
+                        # [1, batch*seq] -> [batch, seq]
+                        # Note: seq_len is the original sequence length from attention_mask
+                        output = {k: v.reshape(batch_size, -1) for k, v in output_dict.items()}
+                    else:
+                        # Normal path: recover left padding
+                        # Defensive padding for new_attention_mask
+                        if new_attention_mask.shape[-1] < output_seq_len:
+                            padding_shape = list(new_attention_mask.shape)
+                            padding_shape[-1] = output_seq_len - new_attention_mask.shape[-1]
+                            mask_padding = torch.zeros(
+                                padding_shape,
+                                dtype=new_attention_mask.dtype,
+                                device=new_attention_mask.device,
+                            )
+                            new_attention_mask_padded = torch.cat([new_attention_mask, mask_padding], dim=-1)
+                        else:
+                            new_attention_mask_padded = new_attention_mask
+
+                        output = {
+                            k: recover_left_padding(v, new_attention_mask_padded, attention_mask, seq_len, post_process=post_process)
+                            for k, v in output_dict.items()
+                        }
             else:
                 output = recover_left_padding(
                     output_orig, new_attention_mask, attention_mask, seq_len, post_process=post_process
