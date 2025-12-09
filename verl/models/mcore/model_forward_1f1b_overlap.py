@@ -324,9 +324,14 @@ def gptmodel_forward_1f1b_overlap_bshd(
     )
 
     if post_process:
-        # Store original masks for recovery
-        attention_mask_out = attention_mask  # Original 2D mask
+        # Store original masks/positions for recovery in _postprocess_bshd closure.
+        # Note: position_ids_out is the original full-sequence position_ids, while
+        # the _postprocess_bshd parameter 'position_ids' comes from chunk_state
+        # which contains new_position_ids (CP-divided). We need the original for
+        # remove_left_padding to work correctly with attention_mask_out.
+        attention_mask_out = attention_mask  # Original 2D mask [batch, seq_len]
         new_attention_mask_out = new_attention_mask  # Transformed 4D mask
+        position_ids_out = position_ids  # Original position_ids [batch, seq_len]
 
         def _postprocess_bshd(
             self,
@@ -407,7 +412,7 @@ def gptmodel_forward_1f1b_overlap_bshd(
                     converted, _, _ = remove_left_padding(
                         v.unsqueeze(-1),  # [batch, seq] -> [batch, seq, 1]
                         attention_mask_out,
-                        position_ids,
+                        position_ids_out,  # Use closure-captured original position_ids
                         sequence_parallel=sequence_parallel,
                         pre_process=True,
                         fixed_seq_len=fixed_seq_len,
@@ -429,7 +434,7 @@ def gptmodel_forward_1f1b_overlap_bshd(
                 labels_converted, _, _ = remove_left_padding(
                     labels.unsqueeze(-1),
                     attention_mask_out,
-                    position_ids,
+                    position_ids_out,  # Use closure-captured original position_ids
                     sequence_parallel=sequence_parallel,
                     pre_process=True,
                     fixed_seq_len=fixed_seq_len,
@@ -439,7 +444,7 @@ def gptmodel_forward_1f1b_overlap_bshd(
                 labels_mask_converted, _, _ = remove_left_padding(
                     labels_mask.unsqueeze(-1),
                     attention_mask_out,
-                    position_ids,
+                    position_ids_out,  # Use closure-captured original position_ids
                     sequence_parallel=sequence_parallel,
                     pre_process=True,
                     fixed_seq_len=fixed_seq_len,
