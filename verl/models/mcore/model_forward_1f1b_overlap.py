@@ -17,6 +17,7 @@
 from typing import Callable, Optional
 
 import torch
+from megatron.core import parallel_state as mpu
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import make_viewless_tensor
@@ -291,6 +292,15 @@ def gptmodel_forward_1f1b_overlap_bshd(
 
     batch_size, seq_len = attention_mask.shape[:2]
 
+    # For PP>1, use fixed sequence length to ensure consistent P2P buffer shapes.
+    # Without this, remove_left_padding computes seq_len dynamically per micro-batch,
+    # causing P2P send/recv buffer mismatches and deadlocks.
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    if pp_size > 1:
+        fixed_seq_len = attention_mask.shape[1]
+    else:
+        fixed_seq_len = None
+
     # BSHD conversion: use remove_left_padding instead of preprocess_packed_seqs
     # Note: remove_left_padding handles CP chunk splitting internally when cp_size > 1
     new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
@@ -299,6 +309,7 @@ def gptmodel_forward_1f1b_overlap_bshd(
         position_ids,
         sequence_parallel=sequence_parallel,
         pre_process=pre_process,
+        fixed_seq_len=fixed_seq_len,
     )
     if pre_process:
         new_input_ids = new_input_ids.contiguous()
@@ -399,6 +410,7 @@ def gptmodel_forward_1f1b_overlap_bshd(
                         position_ids,
                         sequence_parallel=sequence_parallel,
                         pre_process=True,
+                        fixed_seq_len=fixed_seq_len,
                     )
                     args[k] = converted.squeeze(-1)  # [batch, new_seq, 1] -> [batch, new_seq]
 
@@ -420,6 +432,7 @@ def gptmodel_forward_1f1b_overlap_bshd(
                     position_ids,
                     sequence_parallel=sequence_parallel,
                     pre_process=True,
+                    fixed_seq_len=fixed_seq_len,
                 )
                 labels_rmpad = labels_converted.squeeze(-1).contiguous()
 
@@ -429,6 +442,7 @@ def gptmodel_forward_1f1b_overlap_bshd(
                     position_ids,
                     sequence_parallel=sequence_parallel,
                     pre_process=True,
+                    fixed_seq_len=fixed_seq_len,
                 )
                 labels_mask_rmpad = labels_mask_converted.squeeze(-1).contiguous()
 
