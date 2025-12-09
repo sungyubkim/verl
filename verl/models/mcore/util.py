@@ -517,8 +517,10 @@ def recover_left_padding(
         cp_group = mpu.get_context_parallel_group()
 
         # Gather results from all CP ranks
+        # Use detach() for other ranks, then replace current rank with original to preserve gradient
         gathered_results = [torch.empty_like(result) for _ in range(cp_size)]
-        torch.distributed.all_gather(gathered_results, result, group=cp_group)
+        torch.distributed.all_gather(gathered_results, result.detach(), group=cp_group)
+        gathered_results[mpu.get_context_parallel_rank()] = result
 
         # Reconstruct full sequence from chunks
         half_seq = seq_len_per_gpu // 2
@@ -544,9 +546,10 @@ def recover_left_padding(
         full_attention_mask = torch.zeros(
             dtype=attention_mask.dtype, device=attention_mask.device, size=(batch_size, full_seq_len)
         )
-        # Gather attention masks from all ranks
+        # Gather attention masks from all ranks (same pattern for consistency)
         gathered_masks = [torch.empty_like(attention_mask) for _ in range(cp_size)]
-        torch.distributed.all_gather(gathered_masks, attention_mask, group=cp_group)
+        torch.distributed.all_gather(gathered_masks, attention_mask.detach(), group=cp_group)
+        gathered_masks[mpu.get_context_parallel_rank()] = attention_mask
 
         for rank in range(cp_size):
             first_dst_start = chunk_size * rank

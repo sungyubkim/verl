@@ -113,14 +113,6 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
             # (e.g., learnable softmax in TransformerEngine)
             sequence_parallel = unwrap_model(model).config.sequence_parallel
             pp_size = mpu.get_pipeline_model_parallel_world_size()
-            cp_size_init = mpu.get_context_parallel_world_size()
-
-            # DEBUG: CP=2 hang 디버깅
-            print(f"[DEBUG model_forward BSHD] "
-                  f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}/{pp_size}, "
-                  f"CP_RANK={mpu.get_context_parallel_rank()}/{cp_size_init}, "
-                  f"pre_process={pre_process}, post_process={post_process}, "
-                  f"batch_size={batch_size}, seq_len={seq_len}", flush=True)
 
             # For PP>1, use fixed sequence length to ensure consistent P2P buffer shapes.
             # Without this, remove_left_padding computes seq_len dynamically per micro-batch,
@@ -131,6 +123,7 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 fixed_seq_len = None  # Dynamic computation (original behavior)
 
             # Remove left padding and convert to right-padded format
+            # Note: remove_left_padding handles CP chunk splitting internally when cp_size > 1
             new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
                 input_ids,
                 attention_mask,
@@ -148,175 +141,43 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 **model_kwargs,
             )
 
-            # DEBUG: model forward 전
-            print(f"[DEBUG model_forward] Before model(), "
-                  f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
-                  f"input_ids.shape={new_input_ids.shape if pre_process else 'N/A'}", flush=True)
-
             output_orig = model(**input_args)
-
-            # DEBUG: model forward 후
-            print(f"[DEBUG model_forward] After model(), "
-                  f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
-                  f"output_orig.shape={output_orig.shape if post_process else 'hidden'}", flush=True)
 
             if post_process and logits_processor is not None:
                 # Detect batch flattening from Megatron-Core PP scheduler.
                 # When variable_seq_lengths=False (i.e., use_sequence_packing=False),
                 # PP scheduler flattens [batch, seq, hidden] -> [1, batch*seq, hidden].
                 # See: Megatron-LM/megatron/core/pipeline_parallel/p2p_communication.py L301
-                output_batch = output_orig.shape[0]
-                output_seq_len = output_orig.shape[1]
-                is_batch_flattened = (output_batch == 1 and batch_size > 1)
+                is_batch_flattened = (output_orig.shape[0] == 1 and batch_size > 1)
 
-                # Handle CP: output_layer does CP all-gather internally, so output_orig has full sequence.
-                # But attention_mask and logits_processor_args are still CP-divided.
-                # We need to all-gather them to match the output shape.
-                cp_size = mpu.get_context_parallel_world_size()
+                # Unflatten output_orig if batch was flattened by PP scheduler
+                if is_batch_flattened:
+                    # [1, batch*seq, vocab] -> [batch, seq_per_gpu, vocab]
+                    seq_per_gpu = output_orig.shape[1] // batch_size
+                    output_orig = output_orig.reshape(batch_size, seq_per_gpu, -1)
 
-                # DEBUG: CP size 확인
-                print(f"[DEBUG model_forward] post_process path, "
-                      f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
-                      f"CP_SIZE={cp_size}, is_batch_flattened={is_batch_flattened}", flush=True)
+                # Process logits_processor_args with remove_left_padding
+                # Note: This handles CP chunk splitting internally when cp_size > 1
+                args = {}
+                for k, v in logits_processor_args.items():
+                    converted, _, _ = remove_left_padding(
+                        v.unsqueeze(-1),  # [batch, seq_len] -> [batch, seq_len, 1]
+                        attention_mask,
+                        position_ids,
+                        sequence_parallel=sequence_parallel,
+                        pre_process=True,
+                        fixed_seq_len=fixed_seq_len,
+                    )
+                    args[k] = converted.squeeze(-1)  # [batch, new_seq_len, 1] -> [batch, new_seq_len]
 
-                if cp_size > 1:
-                    # CP>1: attention_mask and logits_processor_args are already full sequence.
-                    # Megatron-Core handles CP internally:
-                    # 1. Input: full sequence passed to GPTModel
-                    # 2. GPTModel internally divides sequence by CP rank (chunk interleaving)
-                    # 3. output_layer does CP all-gather and returns full sequence
-                    # Therefore, NO external CP processing needed here!
+                output_dict = logits_processor(output_orig, **args)
 
-                    # DEBUG: CP>1 path (simplified)
-                    print(f"[DEBUG model_forward] CP>1 path (simplified), "
-                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
-                          f"CP_RANK={mpu.get_context_parallel_rank()}, "
-                          f"attention_mask.shape={attention_mask.shape}, "
-                          f"output_orig.shape={output_orig.shape}", flush=True)
-
-                    # Process logits_processor_args: already full sequence, just handle batch flatten
-                    args = {}
-                    for k, v in logits_processor_args.items():  # v: [batch, full_seq]
-                        if is_batch_flattened:
-                            # [batch, seq] -> [1, batch*seq]
-                            converted = v.reshape(1, -1)
-                            # Truncate/pad to match output_seq_len if needed
-                            if converted.shape[1] > output_seq_len:
-                                converted = converted[:, :output_seq_len]
-                            elif converted.shape[1] < output_seq_len:
-                                padding = torch.zeros(
-                                    1, output_seq_len - converted.shape[1],
-                                    dtype=v.dtype, device=v.device
-                                )
-                                converted = torch.cat([converted, padding], dim=1)
-                        else:
-                            # Already full seq, just ensure shape matches output_seq_len
-                            if v.shape[1] > output_seq_len:
-                                converted = v[:, :output_seq_len]
-                            elif v.shape[1] < output_seq_len:
-                                padding = torch.zeros(
-                                    batch_size, output_seq_len - v.shape[1],
-                                    dtype=v.dtype, device=v.device
-                                )
-                                converted = torch.cat([v, padding], dim=1)
-                            else:
-                                converted = v
-                        args[k] = converted
-
-                    # DEBUG: logits_processor 전 (CP>1)
-                    print(f"[DEBUG model_forward] BEFORE logits_processor (CP>1), "
-                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
-                          f"output_orig.shape={output_orig.shape}, "
-                          f"args shapes: {{{', '.join(f'{k}: {v.shape}' for k, v in args.items())}}}", flush=True)
-
-                    output_dict = logits_processor(output_orig, **args)
-
-                    # DEBUG: logits_processor 후 (CP>1)
-                    print(f"[DEBUG model_forward] AFTER logits_processor (CP>1), "
-                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}", flush=True)
-
-                    # Unflatten if batch was flattened
-                    if is_batch_flattened:
-                        output = {k: v.reshape(batch_size, -1) for k, v in output_dict.items()}
-                    else:
-                        # Recover to original left-padded format
-                        output = {}
-                        for k, v in output_dict.items():
-                            recovered = torch.zeros(batch_size, seq_len, dtype=v.dtype, device=v.device)
-                            for i in range(batch_size):
-                                valid_len = attention_mask[i].sum().long().item()
-                                orig_valid_len = min(valid_len, seq_len)
-                                # Left-padded: place valid tokens at the end
-                                recovered[i, -orig_valid_len:] = v[i, :orig_valid_len]
-                            output[k] = recovered
-                else:
-                    # CP=1: use original logic
-                    args = {}
-                    for k, v in logits_processor_args.items():
-                        # Use remove_left_padding for 2D tensors by adding/removing a dimension
-                        converted, _, _ = remove_left_padding(
-                            v.unsqueeze(-1),  # [batch, seq_len] -> [batch, seq_len, 1]
-                            attention_mask,
-                            position_ids,
-                            sequence_parallel=sequence_parallel,
-                            pre_process=True,
-                            fixed_seq_len=fixed_seq_len,  # Use same fixed_seq_len for consistency
-                        )
-                        converted = converted.squeeze(-1)  # [batch, new_seq_len, 1] -> [batch, new_seq_len]
-
-                        # Handle batch flattening: [batch, seq] -> [1, batch*seq]
-                        if is_batch_flattened:
-                            converted = converted.reshape(1, -1)
-
-                        # Defensive padding/truncation for seq_len mismatch
-                        if converted.shape[1] < output_seq_len:
-                            padding = torch.zeros(
-                                converted.shape[0],
-                                output_seq_len - converted.shape[1],
-                                dtype=converted.dtype,
-                                device=converted.device,
-                            )
-                            converted = torch.cat([converted, padding], dim=1)
-                        elif converted.shape[1] > output_seq_len:
-                            converted = converted[:, :output_seq_len]
-
-                        args[k] = converted
-
-                    # DEBUG: logits_processor 전 (CP=1)
-                    print(f"[DEBUG model_forward] BEFORE logits_processor (CP=1), "
-                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}, "
-                          f"output_orig.shape={output_orig.shape}", flush=True)
-
-                    output_dict = logits_processor(output_orig, **args)
-
-                    # DEBUG: logits_processor 후 (CP=1)
-                    print(f"[DEBUG model_forward] AFTER logits_processor (CP=1), "
-                          f"PP_RANK={mpu.get_pipeline_model_parallel_rank()}", flush=True)
-
-                    # Unflatten results if batch was flattened
-                    if is_batch_flattened:
-                        # [1, batch*seq] -> [batch, seq]
-                        # Note: seq_len is the original sequence length from attention_mask
-                        output = {k: v.reshape(batch_size, -1) for k, v in output_dict.items()}
-                    else:
-                        # Normal path: recover left padding
-                        # Defensive padding for new_attention_mask
-                        if new_attention_mask.shape[-1] < output_seq_len:
-                            padding_shape = list(new_attention_mask.shape)
-                            padding_shape[-1] = output_seq_len - new_attention_mask.shape[-1]
-                            mask_padding = torch.zeros(
-                                padding_shape,
-                                dtype=new_attention_mask.dtype,
-                                device=new_attention_mask.device,
-                            )
-                            new_attention_mask_padded = torch.cat([new_attention_mask, mask_padding], dim=-1)
-                        else:
-                            new_attention_mask_padded = new_attention_mask
-
-                        output = {
-                            k: recover_left_padding(v, new_attention_mask_padded, attention_mask, seq_len, post_process=post_process)
-                            for k, v in output_dict.items()
-                        }
+                # Recover to original left-padded format
+                # Note: recover_left_padding handles CP all-gather internally when cp_size > 1
+                output = {
+                    k: recover_left_padding(v, new_attention_mask, attention_mask, seq_len, post_process=post_process)
+                    for k, v in output_dict.items()
+                }
             else:
                 output = recover_left_padding(
                     output_orig, new_attention_mask, attention_mask, seq_len, post_process=post_process
