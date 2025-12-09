@@ -716,14 +716,27 @@ class MegatronPPOActor(BasePPOActor):
             max_token_len = None
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
-            metric_micro_batch = self.forward_backward_batch(
-                data,
-                calculate_entropy=calculate_entropy,
-                use_dynamic_bsz=self.config.use_dynamic_bsz,
-                micro_batch_size=micro_batch_size,
-                max_token_len=max_token_len,
-                mini_batch_size=self.config.ppo_mini_batch_size,
-            )
+
+            # When using 1F1B overlap (overlap_moe_expert_parallel_comm=True), the forward functions
+            # patch model._postprocess to return tuple. Use context manager to restore after each
+            # update_policy call, ensuring compute_log_prob uses original _postprocess.
+            use_1f1b_overlap = getattr(self.tf_config, 'overlap_moe_expert_parallel_comm', False)
+            if use_1f1b_overlap:
+                from verl.models.mcore.model_forward_1f1b_overlap import postprocess_patch_context
+                context = postprocess_patch_context(self.actor_module)
+            else:
+                from contextlib import nullcontext
+                context = nullcontext()
+
+            with context:
+                metric_micro_batch = self.forward_backward_batch(
+                    data,
+                    calculate_entropy=calculate_entropy,
+                    use_dynamic_bsz=self.config.use_dynamic_bsz,
+                    micro_batch_size=micro_batch_size,
+                    max_token_len=max_token_len,
+                    mini_batch_size=self.config.ppo_mini_batch_size,
+                )
             metric_micro_batch = metric_micro_batch["output"]
             for metric in metric_micro_batch:
                 # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask

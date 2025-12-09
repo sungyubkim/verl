@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 import torch
@@ -525,3 +526,41 @@ def gptmodel_forward_1f1b_overlap_bshd(
         )
 
     return schedule_plan
+
+
+@contextmanager
+def postprocess_patch_context(model_chunks):
+    """Context manager to handle _postprocess patching for 1F1B overlap.
+
+    When using gptmodel_forward_1f1b_overlap or gptmodel_forward_1f1b_overlap_bshd,
+    the model's _postprocess method is patched to return a tuple instead of a tensor.
+    This patching persists after the function returns, causing issues when
+    compute_log_prob uses model_forward_gen which expects a tensor return.
+
+    This context manager saves the original _postprocess methods before entering
+    and restores them after exiting, ensuring that:
+    - update_policy: uses patched _postprocess (for 1F1B overlap)
+    - compute_log_prob: uses original _postprocess (returns tensor)
+
+    Args:
+        model_chunks: List of model chunks (VPP chunks) or single model
+    """
+    # Ensure model_chunks is a list
+    if not isinstance(model_chunks, list):
+        model_chunks = [model_chunks]
+
+    # Save original _postprocess for each model chunk
+    originals = {}
+    for i, chunk in enumerate(model_chunks):
+        unwrapped = unwrap_model(chunk)
+        if hasattr(unwrapped, '_postprocess'):
+            originals[i] = unwrapped._postprocess
+
+    try:
+        yield
+    finally:
+        # Restore original _postprocess
+        for i, chunk in enumerate(model_chunks):
+            if i in originals:
+                unwrapped = unwrap_model(chunk)
+                unwrapped._postprocess = originals[i]
