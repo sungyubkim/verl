@@ -5,8 +5,12 @@ rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
 strategy: ${actor_rollout_ref.actor.strategy}
 
 # whether to enable torch.compile
-# same as actor_rollout_ref.actor.use_torch_compile if it exists, otherwise 1
+# same as actor_rollout_ref.actor.use_torch_compile if it exists, otherwise true
 use_torch_compile: ${oc.select:actor_rollout_ref.actor.use_torch_compile,true}
+
+# whether to use sequence packing (THD format) for forward pass
+# same as actor_rollout_ref.actor.use_sequence_packing if it exists, otherwise true
+use_sequence_packing: ${oc.select:actor_rollout_ref.actor.use_sequence_packing,true}
 
 # [Will be deprecated, use log_prob_micro_batch_size_per_gpu]
 # The batch size for one forward pass in the computation of log_prob. Global batch size.
