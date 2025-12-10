@@ -143,10 +143,15 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
             output_orig = model(**input_args)
 
-            # DEBUG: Check model output
-            if post_process:
-                print(f"[DEBUG BSHD] output_orig.shape: {output_orig.shape}, batch_size: {batch_size}")
-                print(f"[DEBUG BSHD] output_orig[0, :3, :5]: {output_orig[0, :3, :5]}")
+            # DEBUG: Check model output (only on DP=0, CP=0, last PP rank)
+            dp_rank = mpu.get_data_parallel_rank()
+            cp_rank = mpu.get_context_parallel_rank() if mpu.get_context_parallel_world_size() > 1 else 0
+            is_debug_rank = (dp_rank == 0 and cp_rank == 0)
+            grad_enabled = torch.is_grad_enabled()
+            path_tag = "UPDATE" if grad_enabled else "COMPUTE"
+            if post_process and is_debug_rank:
+                print(f"[DEBUG BSHD {path_tag}] output_orig.shape: {output_orig.shape}, batch_size: {batch_size}")
+                print(f"[DEBUG BSHD {path_tag}] output_orig[0, :3, :5]: {output_orig[0, :3, :5]}")
 
             if post_process and logits_processor is not None:
                 # Detect batch flattening from Megatron-Core PP scheduler.
@@ -177,9 +182,10 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
                 output_dict = logits_processor(output_orig, **args)
 
-                # DEBUG: Check logits_processor output
-                print(f"[DEBUG BSHD] log_probs shape: {output_dict['log_probs'].shape}")
-                print(f"[DEBUG BSHD] log_probs[0, :5]: {output_dict['log_probs'][0, :5]}")
+                # DEBUG: Check logits_processor output (only on debug rank)
+                if is_debug_rank:
+                    print(f"[DEBUG BSHD {path_tag}] log_probs shape: {output_dict['log_probs'].shape}")
+                    print(f"[DEBUG BSHD {path_tag}] log_probs[0, :5]: {output_dict['log_probs'][0, :5]}")
 
                 # Recover to original left-padded format
                 # Note: recover_left_padding handles CP all-gather internally when cp_size > 1
@@ -188,9 +194,10 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                     for k, v in output_dict.items()
                 }
 
-                # DEBUG: Check final output after recover_left_padding
-                print(f"[DEBUG BSHD] final log_probs shape: {output['log_probs'].shape}")
-                print(f"[DEBUG BSHD] final log_probs[0, :5]: {output['log_probs'][0, :5]}")
+                # DEBUG: Check final output after recover_left_padding (only on debug rank)
+                if is_debug_rank:
+                    print(f"[DEBUG BSHD {path_tag}] final log_probs shape: {output['log_probs'].shape}")
+                    print(f"[DEBUG BSHD {path_tag}] final log_probs[0, :5]: {output['log_probs'][0, :5]}")
             else:
                 output = recover_left_padding(
                     output_orig, new_attention_mask, attention_mask, seq_len, post_process=post_process
