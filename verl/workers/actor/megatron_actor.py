@@ -501,6 +501,10 @@ class MegatronPPOActor(BasePPOActor):
                     # DEBUG: Compare log_prob (from update forward) vs old_log_probs
                     old_log_probs = data.get("old_log_probs", None)
                     if old_log_probs is not None:
+                        # Tensor properties
+                        print(f"[DEBUG KL] log_prob: shape={log_prob.shape}, dtype={log_prob.dtype}, device={log_prob.device}")
+                        print(f"[DEBUG KL] old_log_probs: shape={old_log_probs.shape}, dtype={old_log_probs.dtype}, device={old_log_probs.device}")
+                        print(f"[DEBUG KL] ref_log_prob: shape={ref_log_prob.shape}, dtype={ref_log_prob.dtype}, device={ref_log_prob.device}")
                         diff = (log_prob - old_log_probs).abs()
                         print(f"[DEBUG KL] log_prob vs old_log_probs diff: max={diff.max():.4f}, mean={diff.mean():.4f}")
                         print(f"[DEBUG KL] log_prob range: [{log_prob.min():.4f}, {log_prob.max():.4f}]")
