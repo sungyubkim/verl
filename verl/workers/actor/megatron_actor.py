@@ -498,6 +498,15 @@ class MegatronPPOActor(BasePPOActor):
                 if self.config.use_kl_loss:
                     ref_log_prob = data["ref_log_prob"]
 
+                    # DEBUG: Compare log_prob (from update forward) vs old_log_probs
+                    old_log_probs = data.get("old_log_probs", None)
+                    if old_log_probs is not None:
+                        diff = (log_prob - old_log_probs).abs()
+                        print(f"[DEBUG KL] log_prob vs old_log_probs diff: max={diff.max():.4f}, mean={diff.mean():.4f}")
+                        print(f"[DEBUG KL] log_prob range: [{log_prob.min():.4f}, {log_prob.max():.4f}]")
+                        print(f"[DEBUG KL] old_log_probs range: [{old_log_probs.min():.4f}, {old_log_probs.max():.4f}]")
+                        print(f"[DEBUG KL] ref_log_prob range: [{ref_log_prob.min():.4f}, {ref_log_prob.max():.4f}]")
+
                     # compute kl loss
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
                     kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
