@@ -506,6 +506,17 @@ class MegatronPPOActor(BasePPOActor):
                         print(f"[DEBUG KL] log_prob range: [{log_prob.min():.4f}, {log_prob.max():.4f}]")
                         print(f"[DEBUG KL] old_log_probs range: [{old_log_probs.min():.4f}, {old_log_probs.max():.4f}]")
                         print(f"[DEBUG KL] ref_log_prob range: [{ref_log_prob.min():.4f}, {ref_log_prob.max():.4f}]")
+                        # DEBUG: Find where the max diff occurs
+                        max_diff_idx = diff.argmax()
+                        batch_idx = max_diff_idx // diff.shape[1]
+                        seq_idx = max_diff_idx % diff.shape[1]
+                        print(f"[DEBUG KL] Max diff at batch={batch_idx}, seq={seq_idx}/{diff.shape[1]}")
+                        print(f"[DEBUG KL] log_prob at max: {log_prob.flatten()[max_diff_idx]:.4f}")
+                        print(f"[DEBUG KL] old_log_probs at max: {old_log_probs.flatten()[max_diff_idx]:.4f}")
+                        # Check diff distribution across sequence positions
+                        diff_per_seq = diff.max(dim=0)[0]  # max diff per sequence position
+                        print(f"[DEBUG KL] diff_per_seq first 5: {diff_per_seq[:5].tolist()}")
+                        print(f"[DEBUG KL] diff_per_seq last 5: {diff_per_seq[-5:].tolist()}")
 
                     # compute kl loss
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
