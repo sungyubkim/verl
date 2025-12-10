@@ -141,6 +141,17 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 **model_kwargs,
             )
 
+            # DEBUG: Check inputs BEFORE model forward
+            import torch
+            cp_rank = mpu.get_context_parallel_rank() if mpu.get_context_parallel_world_size() > 1 else 0
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            print(f"[DEBUG model_forward_gen CP={cp_rank} PP={pp_rank}] BEFORE model forward:")
+            print(f"  new_input_ids shape: {new_input_ids.shape}, range: [{new_input_ids.min()}, {new_input_ids.max()}]")
+            print(f"  new_attention_mask shape: {new_attention_mask.shape}")
+            if new_position_ids is not None:
+                print(f"  new_position_ids shape: {new_position_ids.shape}, range: [{new_position_ids.min()}, {new_position_ids.max()}]")
+            # END DEBUG
+
             output_orig = model(**input_args)
 
             # DEBUG: Check output_orig for NaN before logits_processor
