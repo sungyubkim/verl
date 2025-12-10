@@ -497,6 +497,24 @@ class MegatronPPOActor(BasePPOActor):
             else:
                 if self.config.use_kl_loss:
                     ref_log_prob = data["ref_log_prob"]
+
+                    # DEBUG: NaN 조사
+                    cp_rank = mpu.get_context_parallel_rank() if mpu.get_context_parallel_world_size() > 1 else 0
+                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                    print(f"[DEBUG CP={cp_rank} PP={pp_rank}] log_prob shape: {log_prob.shape}, ref_log_prob shape: {ref_log_prob.shape}")
+                    print(f"[DEBUG CP={cp_rank} PP={pp_rank}] log_prob nan: {torch.isnan(log_prob).sum()}, ref nan: {torch.isnan(ref_log_prob).sum()}")
+                    print(f"[DEBUG CP={cp_rank} PP={pp_rank}] log_prob range: [{log_prob.min():.4f}, {log_prob.max():.4f}]")
+                    print(f"[DEBUG CP={cp_rank} PP={pp_rank}] ref_log_prob range: [{ref_log_prob.min():.4f}, {ref_log_prob.max():.4f}]")
+                    if torch.isnan(log_prob).any():
+                        nan_mask = torch.isnan(log_prob)
+                        nan_indices = torch.where(nan_mask)
+                        print(f"[DEBUG CP={cp_rank}] NaN in log_prob at batch: {nan_indices[0][:5].tolist()}, seq: {nan_indices[1][:5].tolist()}")
+                    if torch.isnan(ref_log_prob).any():
+                        nan_mask = torch.isnan(ref_log_prob)
+                        nan_indices = torch.where(nan_mask)
+                        print(f"[DEBUG CP={cp_rank}] NaN in ref_log_prob at batch: {nan_indices[0][:5].tolist()}, seq: {nan_indices[1][:5].tolist()}")
+                    # END DEBUG
+
                     # compute kl loss
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
                     kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
@@ -581,6 +599,12 @@ class MegatronPPOActor(BasePPOActor):
                 pp_size = mpu.get_pipeline_model_parallel_world_size()
 
                 def logits_processor(logits, label, label_mask):
+                    # DEBUG logits_processor
+                    cp_rank = mpu.get_context_parallel_rank() if mpu.get_context_parallel_world_size() > 1 else 0
+                    print(f"[DEBUG logits_processor CP={cp_rank}] logits shape: {logits.shape}, label shape: {label.shape}")
+                    print(f"[DEBUG logits_processor CP={cp_rank}] logits nan: {torch.isnan(logits).sum()}, logits inf: {torch.isinf(logits).sum()}")
+                    # END DEBUG
+
                     assert logits.shape[:2] == label.shape[:2], (
                         f"Shape mismatch: logits {logits.shape[:2]} vs label {label.shape[:2]}. "
                         f"This may happen in PP>1 with BSHD format. "
