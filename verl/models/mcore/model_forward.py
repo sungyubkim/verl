@@ -143,6 +143,11 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
             output_orig = model(**input_args)
 
+            # DEBUG: Check model output
+            if post_process:
+                print(f"[DEBUG BSHD] output_orig.shape: {output_orig.shape}, batch_size: {batch_size}")
+                print(f"[DEBUG BSHD] output_orig[0, :3, :5]: {output_orig[0, :3, :5]}")
+
             if post_process and logits_processor is not None:
                 # Detect batch flattening from Megatron-Core PP scheduler.
                 # When variable_seq_lengths=False (i.e., use_sequence_packing=False),
@@ -172,12 +177,20 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
                 output_dict = logits_processor(output_orig, **args)
 
+                # DEBUG: Check logits_processor output
+                print(f"[DEBUG BSHD] log_probs shape: {output_dict['log_probs'].shape}")
+                print(f"[DEBUG BSHD] log_probs[0, :5]: {output_dict['log_probs'][0, :5]}")
+
                 # Recover to original left-padded format
                 # Note: recover_left_padding handles CP all-gather internally when cp_size > 1
                 output = {
                     k: recover_left_padding(v, new_attention_mask, attention_mask, seq_len, post_process=post_process)
                     for k, v in output_dict.items()
                 }
+
+                # DEBUG: Check final output after recover_left_padding
+                print(f"[DEBUG BSHD] final log_probs shape: {output['log_probs'].shape}")
+                print(f"[DEBUG BSHD] final log_probs[0, :5]: {output['log_probs'][0, :5]}")
             else:
                 output = recover_left_padding(
                     output_orig, new_attention_mask, attention_mask, seq_len, post_process=post_process
