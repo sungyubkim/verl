@@ -1133,6 +1133,10 @@ class RayPPOTrainer:
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            # DEBUG: Check old_log_probs
+                            print(f"[DEBUG KL] old_log_probs shape: {old_log_prob.batch['old_log_probs'].shape}")
+                            print(f"[DEBUG KL] old_log_probs range: [{old_log_prob.batch['old_log_probs'].min():.4f}, {old_log_prob.batch['old_log_probs'].max():.4f}]")
+                            print(f"[DEBUG KL] old_log_probs mean: {old_log_prob.batch['old_log_probs'].mean():.4f}")
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1158,6 +1162,12 @@ class RayPPOTrainer:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                            # DEBUG: Check ref_log_prob and KL
+                            print(f"[DEBUG KL] ref_log_prob shape: {ref_log_prob.batch['ref_log_prob'].shape}")
+                            print(f"[DEBUG KL] ref_log_prob range: [{ref_log_prob.batch['ref_log_prob'].min():.4f}, {ref_log_prob.batch['ref_log_prob'].max():.4f}]")
+                            print(f"[DEBUG KL] ref_log_prob mean: {ref_log_prob.batch['ref_log_prob'].mean():.4f}")
+                            kl_debug = batch.batch['old_log_probs'] - ref_log_prob.batch['ref_log_prob']
+                            print(f"[DEBUG KL] KL (old-ref) range: [{kl_debug.min():.4f}, {kl_debug.max():.4f}], mean: {kl_debug.mean():.4f}")
                             batch = batch.union(ref_log_prob)
 
                     # compute values

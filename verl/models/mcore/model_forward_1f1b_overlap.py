@@ -408,14 +408,6 @@ def gptmodel_forward_1f1b_overlap_bshd(
 
                 # Process logits_processor_args with remove_left_padding
                 # Note: This handles CP chunk splitting internally when cp_size > 1
-
-                # DEBUG _postprocess_bshd
-                cp_rank = mpu.get_context_parallel_rank() if mpu.get_context_parallel_world_size() > 1 else 0
-                print(f"[DEBUG _postprocess CP={cp_rank}] output_orig shape: {output_orig.shape}")
-                for k, v in logits_processor_args.items():
-                    print(f"[DEBUG _postprocess CP={cp_rank}] {k} shape before remove_left_padding: {v.shape}")
-                # END DEBUG
-
                 args = {}
                 for k, v in logits_processor_args.items():
                     converted, _, _ = remove_left_padding(
@@ -426,9 +418,6 @@ def gptmodel_forward_1f1b_overlap_bshd(
                         pre_process=True,
                         fixed_seq_len=fixed_seq_len,
                     )
-                    # DEBUG
-                    print(f"[DEBUG _postprocess CP={cp_rank}] {k} shape after remove_left_padding: {converted.squeeze(-1).shape}")
-                    # END DEBUG
                     args[k] = converted.squeeze(-1)  # [batch, new_seq, 1] -> [batch, new_seq]
 
                 output_dict = logits_processor(output_orig, **args)
