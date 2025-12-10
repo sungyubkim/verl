@@ -535,6 +535,10 @@ class MegatronPPOActor(BasePPOActor):
                 model: the model
                 return_schedule_plan: whether to return the schedule plan, for 1f1b overlap
             """
+            # DEBUG: Show forward path selection
+            cp_rank = mpu.get_context_parallel_rank() if mpu.get_context_parallel_world_size() > 1 else 0
+            print(f"[DEBUG forward_step CP={cp_rank}] return_schedule_plan={return_schedule_plan}, calculate_entropy={calculate_entropy}, forward_only={forward_only}")
+            # END DEBUG
             if return_schedule_plan:
                 assert self.tf_config.overlap_moe_expert_parallel_comm, (
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
@@ -635,6 +639,9 @@ class MegatronPPOActor(BasePPOActor):
 
                 # THD pattern: use schedule_plan only when return_schedule_plan=True
                 if return_schedule_plan:
+                    # DEBUG: Using 1F1B overlap path
+                    print(f"[DEBUG forward_step CP={cp_rank}] >>> USING gptmodel_forward_1f1b_overlap_bshd (1F1B overlap)")
+                    # END DEBUG
                     from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap_bshd
 
                     output = gptmodel_forward_1f1b_overlap_bshd(
@@ -650,6 +657,9 @@ class MegatronPPOActor(BasePPOActor):
                         temperature=temperature,
                     )
                 else:
+                    # DEBUG: Using normal forward path (model_forward_gen)
+                    print(f"[DEBUG forward_step CP={cp_rank}] >>> USING get_mcore_forward_fn (normal forward, use_sequence_packing={self.use_sequence_packing})")
+                    # END DEBUG
                     forward_fn = get_mcore_forward_fn(self.hf_config, use_sequence_packing=self.use_sequence_packing)
                     output = forward_fn(
                         model=model,

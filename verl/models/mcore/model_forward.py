@@ -143,6 +143,16 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
             output_orig = model(**input_args)
 
+            # DEBUG: Check output_orig for NaN before logits_processor
+            import torch
+            cp_rank = mpu.get_context_parallel_rank() if mpu.get_context_parallel_world_size() > 1 else 0
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            print(f"[DEBUG model_forward_gen CP={cp_rank} PP={pp_rank}] output_orig shape: {output_orig.shape}")
+            print(f"[DEBUG model_forward_gen CP={cp_rank} PP={pp_rank}] output_orig nan: {torch.isnan(output_orig).sum()}, inf: {torch.isinf(output_orig).sum()}")
+            if torch.isnan(output_orig).any():
+                print(f"[DEBUG model_forward_gen CP={cp_rank}] NaN detected in output_orig BEFORE logits_processor!")
+            # END DEBUG
+
             if post_process and logits_processor is not None:
                 # Detect batch flattening from Megatron-Core PP scheduler.
                 # When variable_seq_lengths=False (i.e., use_sequence_packing=False),
