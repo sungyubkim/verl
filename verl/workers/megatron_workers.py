@@ -804,6 +804,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._ref_is_offload_param:
             load_megatron_model_to_gpu(self.ref_module, load_grad=False)
             log_gpu_memory_usage("After load ref params and grad during compute_ref_log_prob", logger=logger)
+
+        # DEBUG: Check ref model parameters for NaN after load
+        import torch
+        total_params = 0
+        nan_params = 0
+        for model_chunk in self.ref_module:
+            for name, param in model_chunk.named_parameters():
+                total_params += param.numel()
+                nan_count = torch.isnan(param.data).sum().item()
+                if nan_count > 0:
+                    nan_params += nan_count
+                    print(f"[DEBUG ref_param] NaN in {name}: {nan_count}/{param.numel()}")
+        print(f"[DEBUG ref_param] Total params: {total_params}, NaN params: {nan_params}")
+        # END DEBUG
+
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
@@ -826,6 +841,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
             log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
+
+        # DEBUG: Check actor model parameters for NaN (for comparison with ref)
+        import torch
+        total_params = 0
+        nan_params = 0
+        for model_chunk in self.actor_module:
+            for name, param in model_chunk.named_parameters():
+                total_params += param.numel()
+                nan_count = torch.isnan(param.data).sum().item()
+                if nan_count > 0:
+                    nan_params += nan_count
+                    print(f"[DEBUG actor_param] NaN in {name}: {nan_count}/{param.numel()}")
+        print(f"[DEBUG actor_param] Total params: {total_params}, NaN params: {nan_params}")
+        # END DEBUG
+
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
