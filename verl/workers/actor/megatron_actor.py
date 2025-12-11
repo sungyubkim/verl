@@ -500,47 +500,42 @@ class MegatronPPOActor(BasePPOActor):
 
                     # DEBUG: Compare log_prob (from update forward) vs old_log_probs
                     old_log_probs = data.get("old_log_probs", None)
-                    if old_log_probs is not None:
-                        # Tensor properties
-                        print(f"[DEBUG KL] log_prob: shape={log_prob.shape}, dtype={log_prob.dtype}, device={log_prob.device}")
-                        print(f"[DEBUG KL] old_log_probs: shape={old_log_probs.shape}, dtype={old_log_probs.dtype}, device={old_log_probs.device}")
-                        print(f"[DEBUG KL] ref_log_prob: shape={ref_log_prob.shape}, dtype={ref_log_prob.dtype}, device={ref_log_prob.device}")
+                    if old_log_probs is not None and mpu.get_data_parallel_rank() == 0:
                         diff = (log_prob - old_log_probs).abs()
-                        print(f"[DEBUG KL] log_prob vs old_log_probs diff: max={diff.max():.4f}, mean={diff.mean():.4f}")
-                        print(f"[DEBUG KL] log_prob range: [{log_prob.min():.4f}, {log_prob.max():.4f}]")
-                        print(f"[DEBUG KL] old_log_probs range: [{old_log_probs.min():.4f}, {old_log_probs.max():.4f}]")
-                        print(f"[DEBUG KL] ref_log_prob range: [{ref_log_prob.min():.4f}, {ref_log_prob.max():.4f}]")
-                        # DEBUG: Find where the max diff occurs
                         max_diff_idx = diff.argmax()
                         batch_idx = max_diff_idx // diff.shape[1]
                         seq_idx = max_diff_idx % diff.shape[1]
-                        print(f"[DEBUG KL] Max diff at batch={batch_idx}, seq={seq_idx}/{diff.shape[1]}")
-                        print(f"[DEBUG KL] log_prob at max: {log_prob.flatten()[max_diff_idx]:.4f}")
-                        print(f"[DEBUG KL] old_log_probs at max: {old_log_probs.flatten()[max_diff_idx]:.4f}")
-                        # Check diff distribution across sequence positions
-                        diff_per_seq = diff.max(dim=0)[0]  # max diff per sequence position
-                        print(f"[DEBUG KL] diff_per_seq first 5: {diff_per_seq[:5].tolist()}")
-                        print(f"[DEBUG KL] diff_per_seq last 5: {diff_per_seq[-5:].tolist()}")
 
                         # Check if non-zero regions match (same sample = same response region)
                         log_prob_nonzero = log_prob != 0
                         old_log_probs_nonzero = old_log_probs != 0
                         nonzero_match = (log_prob_nonzero == old_log_probs_nonzero).all()
-                        print(f"[DEBUG KL] non-zero mask match: {nonzero_match}")
+
+                        # Build single log message
+                        log_lines = [
+                            "=" * 60,
+                            f"[DEBUG KL] DP=0, shape={log_prob.shape}",
+                            f"  diff: max={diff.max():.6f}, mean={diff.mean():.6f}",
+                            f"  log_prob range: [{log_prob.min():.4f}, {log_prob.max():.4f}]",
+                            f"  old_log_probs range: [{old_log_probs.min():.4f}, {old_log_probs.max():.4f}]",
+                            f"  max diff at: batch={batch_idx}, seq={seq_idx}",
+                            f"  values at max: log_prob={log_prob.flatten()[max_diff_idx]:.6f}, old={old_log_probs.flatten()[max_diff_idx]:.6f}",
+                            f"  non-zero mask match: {nonzero_match}",
+                        ]
 
                         if not nonzero_match:
-                            mismatch = log_prob_nonzero != old_log_probs_nonzero
-                            mismatch_count = mismatch.sum().item()
-                            # Compare non-zero range of first sample
-                            lp_nz_idx = log_prob_nonzero[0].nonzero(as_tuple=True)[0]
-                            old_nz_idx = old_log_probs_nonzero[0].nonzero(as_tuple=True)[0]
-                            print(f"[DEBUG KL] mismatch count: {mismatch_count}")
-                            lp_start = lp_nz_idx[0].item() if len(lp_nz_idx) > 0 else "N/A"
-                            lp_end = lp_nz_idx[-1].item() if len(lp_nz_idx) > 0 else "N/A"
-                            old_start = old_nz_idx[0].item() if len(old_nz_idx) > 0 else "N/A"
-                            old_end = old_nz_idx[-1].item() if len(old_nz_idx) > 0 else "N/A"
-                            print(f"[DEBUG KL] log_prob[0] non-zero range: [{lp_start}, {lp_end}]")
-                            print(f"[DEBUG KL] old_log_probs[0] non-zero range: [{old_start}, {old_end}]")
+                            mismatch_count = (log_prob_nonzero != old_log_probs_nonzero).sum().item()
+                            # Per-sample non-zero ranges
+                            for i in range(min(2, log_prob.shape[0])):
+                                lp_nz = log_prob_nonzero[i].nonzero(as_tuple=True)[0]
+                                old_nz = old_log_probs_nonzero[i].nonzero(as_tuple=True)[0]
+                                lp_range = f"[{lp_nz[0].item()}, {lp_nz[-1].item()}]" if len(lp_nz) > 0 else "N/A"
+                                old_range = f"[{old_nz[0].item()}, {old_nz[-1].item()}]" if len(old_nz) > 0 else "N/A"
+                                log_lines.append(f"  sample[{i}] non-zero: log_prob={lp_range}, old={old_range}")
+                            log_lines.append(f"  total mismatch count: {mismatch_count}")
+
+                        log_lines.append("=" * 60)
+                        print("\n".join(log_lines), flush=True)
 
                     # compute kl loss
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
