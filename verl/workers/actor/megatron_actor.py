@@ -522,6 +522,26 @@ class MegatronPPOActor(BasePPOActor):
                         print(f"[DEBUG KL] diff_per_seq first 5: {diff_per_seq[:5].tolist()}")
                         print(f"[DEBUG KL] diff_per_seq last 5: {diff_per_seq[-5:].tolist()}")
 
+                        # Check if non-zero regions match (same sample = same response region)
+                        log_prob_nonzero = log_prob != 0
+                        old_log_probs_nonzero = old_log_probs != 0
+                        nonzero_match = (log_prob_nonzero == old_log_probs_nonzero).all()
+                        print(f"[DEBUG KL] non-zero mask match: {nonzero_match}")
+
+                        if not nonzero_match:
+                            mismatch = log_prob_nonzero != old_log_probs_nonzero
+                            mismatch_count = mismatch.sum().item()
+                            # Compare non-zero range of first sample
+                            lp_nz_idx = log_prob_nonzero[0].nonzero(as_tuple=True)[0]
+                            old_nz_idx = old_log_probs_nonzero[0].nonzero(as_tuple=True)[0]
+                            print(f"[DEBUG KL] mismatch count: {mismatch_count}")
+                            lp_start = lp_nz_idx[0].item() if len(lp_nz_idx) > 0 else "N/A"
+                            lp_end = lp_nz_idx[-1].item() if len(lp_nz_idx) > 0 else "N/A"
+                            old_start = old_nz_idx[0].item() if len(old_nz_idx) > 0 else "N/A"
+                            old_end = old_nz_idx[-1].item() if len(old_nz_idx) > 0 else "N/A"
+                            print(f"[DEBUG KL] log_prob[0] non-zero range: [{lp_start}, {lp_end}]")
+                            print(f"[DEBUG KL] old_log_probs[0] non-zero range: [{old_start}, {old_end}]")
+
                     # compute kl loss
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
                     kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
