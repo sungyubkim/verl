@@ -200,7 +200,10 @@ def make_megatron_module(
         override_model_config = {}
 
     # Save original attn_mask_type before it might be overwritten by model config extraction
+    # For vanilla_mbridge=False, tf_config is None but attn_mask_type may be set on provider
     original_attn_mask_type = getattr(tf_config, "attn_mask_type", None)
+    if original_attn_mask_type is None and provider is not None:
+        original_attn_mask_type = getattr(provider, "attn_mask_type", None)
 
     if bridge is not None:
         if provider is None:
