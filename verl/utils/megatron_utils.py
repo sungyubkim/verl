@@ -177,6 +177,11 @@ def _update_attn_mask_type(model, attn_mask_type):
     and when using mbridge, we can't modify the layer spec before model creation.
     """
     from megatron.core.transformer.attention import Attention
+    from megatron.core.transformer.enums import AttnMaskType
+
+    # Convert string to AttnMaskType enum if needed (hydra config passes string)
+    if isinstance(attn_mask_type, str):
+        attn_mask_type = AttnMaskType[attn_mask_type]
 
     model_list = model if isinstance(model, list) else [model]
     for m in model_list:
