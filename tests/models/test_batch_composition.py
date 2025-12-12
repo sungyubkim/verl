@@ -375,7 +375,7 @@ def test_batch_composition(tp_size: int = 1, vanilla_mbridge: bool = True):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size")
-    parser.add_argument("--bridge", type=str, default="mbridge", choices=["mbridge", "megatron"])
+    parser.add_argument("--bridge", type=str, default="megatron", choices=["mbridge", "megatron"])
     args = parser.parse_args()
 
     vanilla_mbridge = args.bridge == "mbridge"
