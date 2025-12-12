@@ -217,7 +217,6 @@ def test_batch_composition(tp_size: int = 1, vanilla_mbridge: bool = True):
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
-        use_sequence_packing=False,  # BSHD format
     )
     optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
     checkpoint_config = CheckpointConfig()

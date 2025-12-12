@@ -210,7 +210,6 @@ def test_batch_composition_training_path(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=1,
-        use_sequence_packing=False,  # BSHD format
     )
     optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
     checkpoint_config = CheckpointConfig()
@@ -247,12 +246,15 @@ def test_batch_composition_training_path(
         log_probs = log_probs.masked_fill(~label_mask, 0.0)
         return {"log_probs": log_probs}
 
-    # Define loss_func for forward_backward_func
-    def loss_func(output, non_loss_data=False):
-        if non_loss_data:
-            return output
-        dummy_loss = torch.tensor(1.0, device="cuda")
-        return dummy_loss, {"output": output}
+    # Define loss_func for forward_backward_func (Production pattern)
+    # Always return (scalar_tensor, extra_data) to avoid deallocate_output_tensor error
+    def loss_func(output):
+        if isinstance(output, dict):
+            device = output["log_probs"].device
+        else:
+            device = output.device if hasattr(output, 'device') else torch.device("cuda")
+        dummy_loss = torch.tensor(1.0, device=device)
+        return dummy_loss, output  # Always (scalar, data) format
 
     def run_forward(batch_dict, batch_size):
         """Run forward pass using forward_backward_func."""
@@ -282,14 +284,19 @@ def test_batch_composition_training_path(
             seq_length=seqlen,
             micro_batch_size=batch_size,
             forward_only=True,
-            collect_non_loss_data=True,
+            # Note: Don't use collect_non_loss_data=True with PP>1
+            # Production pattern: loss_func always returns (scalar, data)
         )
 
         if mpu.is_pipeline_last_stage():
-            # output is a list of (output_dict,) tuples from each microbatch
-            output_dict = output[0]
-            if isinstance(output_dict, tuple):
-                output_dict = output_dict[0]
+            # output is a list of (scalar_loss, extra_data) tuples from loss_func
+            # output = [(dummy_loss, {"log_probs": tensor}), ...]
+            output_data = output[0]
+            if isinstance(output_data, tuple) and len(output_data) >= 2:
+                # Extract dict from second element of loss_func return
+                output_dict = output_data[1]
+            else:
+                output_dict = output_data
             return output_dict["log_probs"]
         return None
 
