@@ -287,6 +287,11 @@ def test_training_mode_batch_composition(
             # No collect_non_loss_data - causes error with forward_only=False
         )
 
+        # Synchronize CUDA after backward pass to ensure all async operations complete
+        # Without this, subsequent forward passes may hang waiting for incomplete backward ops
+        if not forward_only:
+            torch.cuda.synchronize()
+
         if mpu.is_pipeline_last_stage():
             # output is a list of (scalar_loss, extra_data) tuples from loss_func
             assert len(output) == 1, f"Expected 1 microbatch output, got {len(output)}"
