@@ -232,19 +232,24 @@ def test_training_mode_batch_composition(
         log_probs = log_probs.masked_fill(~label_mask, 0.0)
         return {"log_probs": log_probs}
 
-    # Pattern from test_bshd_pp_forward.py that works with PP>1
-    def loss_func(output, non_loss_data=False):
-        if non_loss_data:
-            return output
-        dummy_loss = torch.tensor(1.0, device="cuda")
-        return dummy_loss, {"output": output}
+    # Production pattern: always return (scalar_tensor, extra_data)
+    # This works with both forward_only=True and forward_only=False
+    # Note: collect_non_loss_data=True + forward_only=False causes
+    # "expected tensor, found dict" error in deallocate_output_tensor
+    def loss_func(output):
+        if isinstance(output, dict):
+            device = output["log_probs"].device
+        else:
+            device = output.device if hasattr(output, 'device') else torch.device("cuda")
+        dummy_loss = torch.tensor(1.0, device=device)
+        return dummy_loss, output  # Always (scalar, dict)
 
     def run_forward(batch_dict, batch_size, forward_only):
         """Run forward pass using forward_backward_func.
 
-        Uses test_bshd_pp_forward.py pattern that works with PP>1:
-        - num_microbatches=1, micro_batch_size=batch_size
-        - collect_non_loss_data=True
+        Production pattern (works with forward_only=True and False):
+        - loss_func always returns (scalar, dict)
+        - No collect_non_loss_data (causes error with forward_only=False)
         """
         def forward_step(batch_iter, model_arg):
             micro_batch = next(batch_iter)
@@ -273,15 +278,17 @@ def test_training_mode_batch_composition(
             seq_length=seqlen,
             micro_batch_size=batch_size,
             forward_only=forward_only,
-            collect_non_loss_data=True,  # Required for PP>1 to work
+            # No collect_non_loss_data - causes error with forward_only=False
         )
 
         if mpu.is_pipeline_last_stage():
-            # output is a list of output_dict from each microbatch
+            # output is a list of (scalar_loss, extra_data) tuples from loss_func
             assert len(output) == 1, f"Expected 1 microbatch output, got {len(output)}"
-            output_dict = output[0]
-            if isinstance(output_dict, tuple):
-                output_dict = output_dict[0]
+            output_data = output[0]
+            if isinstance(output_data, tuple) and len(output_data) >= 2:
+                output_dict = output_data[1]  # Extract dict from second element
+            else:
+                output_dict = output_data
             return output_dict["log_probs"]
         return None
 
