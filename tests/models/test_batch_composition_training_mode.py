@@ -291,10 +291,10 @@ def test_training_mode_batch_composition(
         # Without this, subsequent forward passes may hang waiting for incomplete backward ops
         if not forward_only:
             torch.cuda.synchronize()
-            # Dummy all-reduce to flush pending NCCL operations across all ranks
-            # Without optimizer.step(), NCCL state may be inconsistent after forward_only=False
-            sync_tensor = torch.zeros(1, device="cuda")
-            dist.all_reduce(sync_tensor)
+            # Use DP group barrier instead of world group all-reduce
+            # World group collectives can conflict with Megatron's PP/TP groups
+            dp_group = mpu.get_data_parallel_group()
+            dist.barrier(group=dp_group)
 
         if mpu.is_pipeline_last_stage():
             # output is a list of (scalar_loss, extra_data) tuples from loss_func
