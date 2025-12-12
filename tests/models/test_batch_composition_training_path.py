@@ -261,6 +261,12 @@ def test_batch_composition_training_path(
         - num_microbatches=1, micro_batch_size=batch_size
         - collect_non_loss_data=True
         """
+        # Debug: Check variable_seq_lengths setting
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        from verl.utils.megatron_utils import get_model_config
+        config = get_model_config(model[0])
+        print(f"[Rank {rank}] variable_seq_lengths={config.variable_seq_lengths}, batch_size={batch_size}")
+
         def forward_step(batch_iter, model_arg):
             micro_batch = next(batch_iter)
             output = bshd_forward(
@@ -302,7 +308,17 @@ def test_batch_composition_training_path(
         return None
 
     # =========================================
-    # Case 1: Individual samples (batch_size=1)
+    # Case 1: [A, B] together (batch_size=2) - TEST FIRST to check if batch_size=2 works
+    # =========================================
+    print(f"[Rank {rank}] Running [A, B] batch forward (batch_size=2) FIRST...")
+    batch_AB = batch_samples(sample_A, sample_B)
+    with torch.no_grad():
+        log_probs_AB = run_forward(batch_AB, batch_size=2)
+    print(f"[Rank {rank}] batch_AB done")
+    dist.barrier()
+
+    # =========================================
+    # Case 2: Individual samples (batch_size=1)
     # =========================================
     print(f"\n[Rank {rank}] Running individual sample forwards...")
 
@@ -325,16 +341,6 @@ def test_batch_composition_training_path(
         log_prob_C1 = run_forward(batch_C, batch_size=1)
         print(f"[Rank {rank}] batch_C done")
         dist.barrier()
-
-    # =========================================
-    # Case 2: [A, B] together (batch_size=2)
-    # =========================================
-    print(f"[Rank {rank}] Running [A, B] batch forward (batch_size=2)...")
-    batch_AB = batch_samples(sample_A, sample_B)
-    with torch.no_grad():
-        log_probs_AB = run_forward(batch_AB, batch_size=2)
-    print(f"[Rank {rank}] batch_AB done")
-    dist.barrier()
 
     # =========================================
     # Case 3: [A, C] together (batch_size=2)
