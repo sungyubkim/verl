@@ -287,10 +287,14 @@ def test_training_mode_batch_composition(
             # No collect_non_loss_data - causes error with forward_only=False
         )
 
-        # Synchronize CUDA after backward pass to ensure all async operations complete
+        # Synchronize after backward pass to ensure all async operations complete
         # Without this, subsequent forward passes may hang waiting for incomplete backward ops
         if not forward_only:
             torch.cuda.synchronize()
+            # Dummy all-reduce to flush pending NCCL operations across all ranks
+            # Without optimizer.step(), NCCL state may be inconsistent after forward_only=False
+            sync_tensor = torch.zeros(1, device="cuda")
+            dist.all_reduce(sync_tensor)
 
         if mpu.is_pipeline_last_stage():
             # output is a list of (scalar_loss, extra_data) tuples from loss_func
