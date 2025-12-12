@@ -232,18 +232,20 @@ def test_training_mode_batch_composition(
         log_probs = log_probs.masked_fill(~label_mask, 0.0)
         return {"log_probs": log_probs}
 
-    # Production pattern: always return (scalar_tensor, extra_data)
-    # This avoids deallocate_output_tensor error with PP>1
-    def loss_func(output):
-        if isinstance(output, dict):
-            device = output["log_probs"].device
-        else:
-            device = output.device if hasattr(output, 'device') else torch.device("cuda")
-        dummy_loss = torch.tensor(1.0, device=device)
-        return dummy_loss, output  # Always (scalar, data) format
+    # Pattern from test_bshd_pp_forward.py that works with PP>1
+    def loss_func(output, non_loss_data=False):
+        if non_loss_data:
+            return output
+        dummy_loss = torch.tensor(1.0, device="cuda")
+        return dummy_loss, {"output": output}
 
     def run_forward(batch_dict, batch_size, forward_only):
-        """Run forward pass using forward_backward_func."""
+        """Run forward pass using forward_backward_func.
+
+        Uses test_bshd_pp_forward.py pattern that works with PP>1:
+        - num_microbatches=1, micro_batch_size=batch_size
+        - collect_non_loss_data=True
+        """
         def forward_step(batch_iter, model_arg):
             micro_batch = next(batch_iter)
             output = bshd_forward(
@@ -260,7 +262,8 @@ def test_training_mode_batch_composition(
             )
             return output, partial(loss_func)
 
-        batch_generator = make_batch_generator([batch_dict], vpp_size=len(model))
+        batch_for_gen = {k: v for k, v in batch_dict.items() if k != "response_length"}
+        batch_generator = make_batch_generator([batch_for_gen], vpp_size=len(model))
 
         output = forward_backward_func(
             forward_step_func=forward_step,
@@ -270,19 +273,15 @@ def test_training_mode_batch_composition(
             seq_length=seqlen,
             micro_batch_size=batch_size,
             forward_only=forward_only,
-            # Note: Don't use collect_non_loss_data=True with PP>1
-            # Production pattern: loss_func always returns (scalar, data)
+            collect_non_loss_data=True,  # Required for PP>1 to work
         )
 
         if mpu.is_pipeline_last_stage():
-            # output is a list of (scalar_loss, extra_data) tuples from loss_func
-            # output = [(dummy_loss, {"log_probs": tensor}), ...]
-            output_data = output[0]
-            if isinstance(output_data, tuple) and len(output_data) >= 2:
-                # Extract dict from second element of loss_func return
-                output_dict = output_data[1]
-            else:
-                output_dict = output_data
+            # output is a list of output_dict from each microbatch
+            assert len(output) == 1, f"Expected 1 microbatch output, got {len(output)}"
+            output_dict = output[0]
+            if isinstance(output_dict, tuple):
+                output_dict = output_dict[0]
             return output_dict["log_probs"]
         return None
 
