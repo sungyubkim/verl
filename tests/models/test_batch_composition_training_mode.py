@@ -251,6 +251,12 @@ def test_training_mode_batch_composition(
         - loss_func always returns (scalar, dict)
         - No collect_non_loss_data (causes error with forward_only=False)
         """
+        # Production pattern: gradient cleanup before forward_only=False
+        # Without this, multiple forward_backward_func calls with forward_only=False
+        # will cause hang due to accumulated gradients
+        if not forward_only:
+            engine.optimizer_zero_grad()
+
         def forward_step(batch_iter, model_arg):
             micro_batch = next(batch_iter)
             output = bshd_forward(
