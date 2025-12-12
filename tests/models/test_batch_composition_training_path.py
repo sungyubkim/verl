@@ -311,25 +311,40 @@ def test_batch_composition_training_path(
     batch_C = batch_samples(sample_C)
 
     with torch.no_grad():
+        print(f"[Rank {rank}] Running batch_A (batch_size=1)...")
         log_prob_A1 = run_forward(batch_A, batch_size=1)
+        print(f"[Rank {rank}] batch_A done")
+        dist.barrier()
+
+        print(f"[Rank {rank}] Running batch_B (batch_size=1)...")
         log_prob_B1 = run_forward(batch_B, batch_size=1)
+        print(f"[Rank {rank}] batch_B done")
+        dist.barrier()
+
+        print(f"[Rank {rank}] Running batch_C (batch_size=1)...")
         log_prob_C1 = run_forward(batch_C, batch_size=1)
+        print(f"[Rank {rank}] batch_C done")
+        dist.barrier()
 
     # =========================================
     # Case 2: [A, B] together (batch_size=2)
     # =========================================
-    print(f"[Rank {rank}] Running [A, B] batch forward...")
+    print(f"[Rank {rank}] Running [A, B] batch forward (batch_size=2)...")
     batch_AB = batch_samples(sample_A, sample_B)
     with torch.no_grad():
         log_probs_AB = run_forward(batch_AB, batch_size=2)
+    print(f"[Rank {rank}] batch_AB done")
+    dist.barrier()
 
     # =========================================
     # Case 3: [A, C] together (batch_size=2)
     # =========================================
-    print(f"[Rank {rank}] Running [A, C] batch forward...")
+    print(f"[Rank {rank}] Running [A, C] batch forward (batch_size=2)...")
     batch_AC = batch_samples(sample_A, sample_C)
     with torch.no_grad():
         log_probs_AC = run_forward(batch_AC, batch_size=2)
+    print(f"[Rank {rank}] batch_AC done")
+    dist.barrier()
 
     # =========================================
     # Compare results
