@@ -246,35 +246,21 @@ def test_batch_composition_training_path(
         log_probs = log_probs.masked_fill(~label_mask, 0.0)
         return {"log_probs": log_probs}
 
-    # Define loss_func for forward_backward_func (Production pattern)
-    # Always return (scalar_tensor, extra_data) to avoid deallocate_output_tensor error
-    def loss_func(output):
-        if isinstance(output, dict):
-            device = output["log_probs"].device
-        else:
-            device = output.device if hasattr(output, 'device') else torch.device("cuda")
-        dummy_loss = torch.tensor(1.0, device=device)
-        return dummy_loss, output  # Always (scalar, data) format
+    # Define loss_func for forward_backward_func
+    # Pattern from test_bshd_pp_forward.py that works with PP>1
+    def loss_func(output, non_loss_data=False):
+        if non_loss_data:
+            return output
+        dummy_loss = torch.tensor(1.0, device="cuda")
+        return dummy_loss, {"output": output}
 
     def run_forward(batch_dict, batch_size):
         """Run forward pass using forward_backward_func.
 
-        Production pattern (from megatron_actor.py):
-        - Split batch into individual samples (micro_batch_size=1)
-        - num_microbatches = batch_size
-        - Concatenate results from each micro-batch
+        Uses test_bshd_pp_forward.py pattern that works with PP>1:
+        - num_microbatches=1, micro_batch_size=batch_size
+        - collect_non_loss_data=True
         """
-        # Production pattern: split batch into individual samples
-        if batch_size > 1:
-            micro_batches = [
-                {k: v[i:i+1] for k, v in batch_dict.items() if k != "response_length"}
-                for i in range(batch_size)
-            ]
-        else:
-            micro_batches = [{k: v for k, v in batch_dict.items() if k != "response_length"}]
-
-        n_micro_batch = len(micro_batches)
-
         def forward_step(batch_iter, model_arg):
             micro_batch = next(batch_iter)
             output = bshd_forward(
@@ -291,31 +277,28 @@ def test_batch_composition_training_path(
             )
             return output, partial(loss_func)
 
-        # Production pattern: make_batch_generator with micro_batches list
-        batch_generator = make_batch_generator(micro_batches, vpp_size=len(model))
+        # Pattern from test_bshd_pp_forward.py
+        batch_for_gen = {k: v for k, v in batch_dict.items() if k != "response_length"}
+        batch_generator = make_batch_generator([batch_for_gen], vpp_size=len(model))
 
         output = forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=batch_generator,
             model=model,
-            num_microbatches=n_micro_batch,  # Production: number of micro-batches
+            num_microbatches=1,
             seq_length=seqlen,
-            micro_batch_size=1,  # Production pattern: always 1
+            micro_batch_size=batch_size,
             forward_only=True,
+            collect_non_loss_data=True,  # Required for PP>1 to work
         )
 
         if mpu.is_pipeline_last_stage():
-            # output is a list of (scalar_loss, extra_data) tuples from loss_func
-            # output = [(dummy_loss, {"log_probs": tensor}), ...] for each micro-batch
-            log_probs_list = []
-            for output_data in output:
-                if isinstance(output_data, tuple) and len(output_data) >= 2:
-                    output_dict = output_data[1]
-                else:
-                    output_dict = output_data
-                log_probs_list.append(output_dict["log_probs"])
-            # Concatenate results from all micro-batches
-            return torch.cat(log_probs_list, dim=0)  # [batch_size, seq_len]
+            # output is a list of output_dict from each microbatch
+            assert len(output) == 1, f"Expected 1 microbatch output, got {len(output)}"
+            output_dict = output[0]
+            if isinstance(output_dict, tuple):
+                output_dict = output_dict[0]
+            return output_dict["log_probs"]
         return None
 
     # =========================================
