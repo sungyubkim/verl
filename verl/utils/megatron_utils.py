@@ -292,11 +292,6 @@ def make_megatron_module(
 
             # Extract TransformerConfig from the created model
             tf_config = get_model_config(model[0] if isinstance(model, list) else model)
-
-            # Explicitly set fp16/bf16 flags based on provider.params_dtype
-            # (mirrors vanilla_mbridge behavior in megatron_workers.py)
-            tf_config.fp16 = provider.params_dtype == torch.float16
-            tf_config.bf16 = provider.params_dtype == torch.bfloat16
         else:
             model = bridge.get_model(
                 post_model_creation_callbacks=post_model_creation_callbacks,

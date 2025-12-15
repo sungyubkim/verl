@@ -178,7 +178,7 @@ class MegatronWorker(Worker):
                 from verl.models.mcore.bridge import AutoBridge
 
                 # Use Megatron-Bridge to convert HF config to Megatron config
-                bridge = AutoBridge.from_hf_pretrained(self.local_path, trust_remote_code=trust_remote_code)
+                bridge = AutoBridge.from_hf_pretrained(self.local_path, trust_remote_code=trust_remote_code, torch_dtype=dtype)
                 # Get Megatron provider and configure it
                 provider = bridge.to_megatron_provider(load_weights=False)
 

@@ -138,7 +138,7 @@ class MegatronEngine(BaseEngine):
 
                 # Use Megatron-Bridge to convert HF config to Megatron config
                 bridge = AutoBridge.from_hf_pretrained(
-                    self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code
+                    self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code, torch_dtype=self.param_dtype
                 )
                 # Get Megatron provider and configure it
                 provider = bridge.to_megatron_provider(load_weights=False)
