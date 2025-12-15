@@ -175,11 +175,11 @@ def postprocess_packed_seqs(
     return output_new
 
 
-def preprocess_packed_seqs_no_padding(
+def preprocess_thd_no_padding(
     input_ids: torch.Tensor, pre_process: bool = True, need_roll: bool = False
 ) -> tuple[torch.Tensor, PackedSeqParams]:
     """
-    Preprocess packed sequences
+    Preprocess THD (Token-Head-Dimension) packed sequences for nested tensor inputs.
     CP splits sequence into CP*2 chunks, and each GPU gets 2 chunks (GPU0 gets first and last chunks, GPU1
     gets second and second last chunks, and so on), this is for load balancing with causal masking.
     See https://github.com/NVIDIA/TransformerEngine/issues/1368
@@ -274,7 +274,7 @@ def preprocess_packed_seqs_no_padding(
         return input_ids, packed_seq_params
 
 
-def postprocess_packed_seqs_no_padding(
+def postprocess_thd_no_padding(
     output: torch.Tensor,
     packed_seq_params: PackedSeqParams,
     input_ids: torch.Tensor,
@@ -338,7 +338,7 @@ def postprocess_packed_seqs_no_padding(
     return output_new_tensor
 
 
-def remove_left_padding(
+def preprocess_bshd(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     position_ids: torch.Tensor,
@@ -347,7 +347,7 @@ def remove_left_padding(
     fixed_seq_len: int = None,
 ):
     """
-    Remove left padding from input_ids, attention_mask and position_ids.
+    Preprocess BSHD (Batch-Sequence-Head-Dimension) format sequences.
 
     When Context Parallelism (CP) is enabled, this function also splits each sequence
     into chunks distributed across CP ranks. Each GPU gets 2 chunks following the
@@ -475,7 +475,7 @@ def remove_left_padding(
         return input_ids, new_attention_mask, new_position_ids
 
 
-def recover_left_padding(
+def postprocess_bshd(
     result,
     attention_mask: torch.Tensor,
     original_attention_mask: torch.Tensor,
@@ -483,7 +483,7 @@ def recover_left_padding(
     post_process: bool = True,
 ):
     """
-    Recover left padding from result.
+    Postprocess BSHD (Batch-Sequence-Head-Dimension) format sequences.
 
     When Context Parallelism (CP) is enabled, this function first gathers results
     from all CP ranks using all-gather, reassembles the chunks in the correct order,
@@ -569,6 +569,77 @@ def recover_left_padding(
     return new_result
 
 
+def preprocess_bshd_no_padding(input_ids: torch.Tensor, pre_process: bool = True, need_roll: bool = False):
+    """
+    Preprocess BSHD sequences for nested tensor inputs.
+    Converts nested tensor to dense BSHD format with attention mask and position IDs.
+
+    Args:
+        input_ids: Nested tensor input IDs
+        pre_process: Whether this rank handles input preprocessing
+        need_roll: Whether to roll input_ids by -1 for label creation
+
+    Returns:
+        input_ids_bshd: Dense tensor [batch_size, max_seqlen]
+        attention_mask: Boolean mask [batch_size, max_seqlen]
+        position_ids: Position IDs [batch_size, max_seqlen]
+    """
+    cp_size = mpu.get_context_parallel_world_size()
+    # TODO: support context parallel size > 1
+    assert cp_size == 1, "Context parallel size > 1 not yet supported for BSHD no-padding"
+
+    batch_size = input_ids.shape[0]
+    seqlens_in_batch = input_ids.offsets().diff()
+    max_seqlen = seqlens_in_batch.max().item()
+    if mpu.get_tensor_model_parallel_world_size() > 1:
+        sp_world_size = mpu.get_tensor_model_parallel_world_size()
+        pad_size = (sp_world_size - max_seqlen % sp_world_size) % sp_world_size
+        max_seqlen = max_seqlen + pad_size
+
+    attention_mask = torch.zeros(batch_size, max_seqlen, dtype=torch.bool, device=input_ids.device)
+    input_ids_bshd = torch.zeros(batch_size, max_seqlen, dtype=input_ids.dtype, device=input_ids.device)
+    for i in range(batch_size):
+        attention_mask[i, : seqlens_in_batch[i]] = True
+        input_ids_bshd[i, : seqlens_in_batch[i]] = input_ids[i]
+    position_ids = torch.arange(max_seqlen, dtype=torch.long, device=input_ids.device)
+    position_ids = position_ids.unsqueeze(0).expand_as(input_ids_bshd)
+    if need_roll:
+        input_ids_bshd = torch.roll(input_ids_bshd, shifts=-1, dims=1)
+
+    return input_ids_bshd, attention_mask, position_ids
+
+
+def postprocess_bshd_no_padding(
+    output: torch.Tensor,
+    attention_mask: torch.Tensor,
+    post_process: bool = True,
+) -> torch.Tensor:
+    """
+    Postprocess BSHD sequences back to nested tensor format.
+
+    Args:
+        output: Dense output tensor [batch_size, max_seqlen, ...]
+        attention_mask: Boolean mask [batch_size, max_seqlen]
+        post_process: Whether this rank handles output postprocessing
+
+    Returns:
+        Nested tensor with variable-length sequences
+    """
+    if not post_process:
+        return output
+
+    batch_size = output.shape[0]
+    output_new = []
+
+    for i in range(batch_size):
+        mask = attention_mask[i].bool()
+        output_new.append(output[i][mask])
+
+    output_new_tensor = torch.nested.as_nested_tensor(output_new, layout=torch.jagged)
+
+    return output_new_tensor
+
+
 def postprocess_packed_seqs_for_dict_output(
     labels_mask: torch.Tensor,
     output: CausalLMOutputForPPO,
@@ -602,3 +673,18 @@ def postprocess_packed_seqs_for_dict_output(
         output.log_probs, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
     )
     return ret
+
+
+# =============================================================================
+# Backward Compatibility Aliases (Deprecated)
+# These aliases are provided for backward compatibility with existing code.
+# Please use the new function names:
+#   - preprocess_thd_no_padding (was preprocess_packed_seqs_no_padding)
+#   - postprocess_thd_no_padding (was postprocess_packed_seqs_no_padding)
+#   - preprocess_bshd (was remove_left_padding)
+#   - postprocess_bshd (was recover_left_padding)
+# =============================================================================
+remove_left_padding = preprocess_bshd
+recover_left_padding = postprocess_bshd
+preprocess_packed_seqs_no_padding = preprocess_thd_no_padding
+postprocess_packed_seqs_no_padding = postprocess_thd_no_padding

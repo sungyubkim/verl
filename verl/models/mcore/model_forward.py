@@ -21,16 +21,20 @@ from megatron.core import parallel_state as mpu
 from verl.utils.megatron_utils import unwrap_model
 
 from .util import (
-    postprocess_packed_seqs,
-    postprocess_packed_seqs_no_padding,
+    # THD format functions
     preprocess_packed_seqs,
-    preprocess_packed_seqs_no_padding,
-    recover_left_padding,
-    remove_left_padding,
+    postprocess_packed_seqs,
+    preprocess_thd_no_padding,
+    postprocess_thd_no_padding,
+    # BSHD format functions (with CP support)
+    preprocess_bshd,
+    postprocess_bshd,
+    preprocess_bshd_no_padding,
+    postprocess_bshd_no_padding,
 )
 
 
-def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = True):
+def model_forward_gen(vision_model: bool = False):
     def model_forward(
         model,
         input_ids,
@@ -40,13 +44,16 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
         logits_processor=None,
         logits_processor_args: dict = None,
         value_model=False,
+        data_format: str = "thd",
     ):
         """Forward pass for models with optional sequence packing.
 
         Args:
-            use_sequence_packing: If True, uses THD format with packed sequences.
-                If False, uses standard BSHD format with attention masks.
+            data_format: Data format to use. Options:
+                - "thd": Token-Head-Dimension packed sequences (default)
+                - "bshd": Batch-Sequence-Head-Dimension standard format
         """
+        assert data_format in ["thd", "bshd"], f"data_format must be 'thd' or 'bshd', got '{data_format}'"
         pre_process = (
             unwrap_model(model).pre_process if not vision_model else False
         )  # vision model does not need pre_process, because we pack the input_ids to thd in the forward function
@@ -64,7 +71,7 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
         batch_size, seq_len = attention_mask.shape[:2]
 
-        if use_sequence_packing:
+        if data_format == "thd":
             # Sequence packing path (THD format)
             fp8 = unwrap_model(model).config.fp8
             use_fp8_padding = fp8 in ["e4m3", "hybrid"]
@@ -107,24 +114,24 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                 output = postprocess_packed_seqs(
                     output_orig, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
                 )
-        else:
-            # Non-packing path (standard BSHD format with attention masks)
+        else:  # data_format == "bshd"
+            # BSHD format path (standard attention mask format)
             # This path is for models that require features incompatible with THD format
             # (e.g., learnable softmax in TransformerEngine)
             sequence_parallel = unwrap_model(model).config.sequence_parallel
             pp_size = mpu.get_pipeline_model_parallel_world_size()
 
             # For PP>1, use fixed sequence length to ensure consistent P2P buffer shapes.
-            # Without this, remove_left_padding computes seq_len dynamically per micro-batch,
+            # Without this, preprocess_bshd computes seq_len dynamically per micro-batch,
             # causing P2P send/recv buffer mismatches and deadlocks.
             if pp_size > 1:
                 fixed_seq_len = attention_mask.shape[1]  # Use original padded length
             else:
                 fixed_seq_len = None  # Dynamic computation (original behavior)
 
-            # Remove left padding and convert to right-padded format
-            # Note: remove_left_padding handles CP chunk splitting internally when cp_size > 1
-            new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
+            # Preprocess BSHD format (convert left-padded to right-padded)
+            # Note: preprocess_bshd handles CP chunk splitting internally when cp_size > 1
+            new_input_ids, new_attention_mask, new_position_ids = preprocess_bshd(
                 input_ids,
                 attention_mask,
                 position_ids,
@@ -145,7 +152,7 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
             if post_process and logits_processor is not None:
                 # Detect batch flattening from Megatron-Core PP scheduler.
-                # When variable_seq_lengths=False (i.e., use_sequence_packing=False),
+                # When variable_seq_lengths=False (i.e., data_format="bshd"),
                 # PP scheduler flattens [batch, seq, hidden] -> [1, batch*seq, hidden].
                 # See: Megatron-LM/megatron/core/pipeline_parallel/p2p_communication.py L301
                 is_batch_flattened = (output_orig.shape[0] == 1 and batch_size > 1)
@@ -156,11 +163,11 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
                     seq_per_gpu = output_orig.shape[1] // batch_size
                     output_orig = output_orig.reshape(batch_size, seq_per_gpu, -1)
 
-                # Process logits_processor_args with remove_left_padding
+                # Process logits_processor_args with preprocess_bshd
                 # Note: This handles CP chunk splitting internally when cp_size > 1
                 args = {}
                 for k, v in logits_processor_args.items():
-                    converted, _, _ = remove_left_padding(
+                    converted, _, _ = preprocess_bshd(
                         v.unsqueeze(-1),  # [batch, seq_len] -> [batch, seq_len, 1]
                         attention_mask,
                         position_ids,
@@ -172,14 +179,14 @@ def model_forward_gen(vision_model: bool = False, use_sequence_packing: bool = T
 
                 output_dict = logits_processor(output_orig, **args)
 
-                # Recover to original left-padded format
-                # Note: recover_left_padding handles CP all-gather internally when cp_size > 1
+                # Postprocess to original left-padded format
+                # Note: postprocess_bshd handles CP all-gather internally when cp_size > 1
                 output = {
-                    k: recover_left_padding(v, new_attention_mask, attention_mask, seq_len, post_process=post_process)
+                    k: postprocess_bshd(v, new_attention_mask, attention_mask, seq_len, post_process=post_process)
                     for k, v in output_dict.items()
                 }
             else:
-                output = recover_left_padding(
+                output = postprocess_bshd(
                     output_orig, new_attention_mask, attention_mask, seq_len, post_process=post_process
                 )
 
@@ -197,8 +204,17 @@ def gptmodel_forward_no_padding(
     logits_processor=None,
     logits_processor_args: dict = None,
     value_model=False,
+    data_format: str = "thd",
 ):
-    """Default forward pass for GPT models with optional sequence packing."""
+    """Default forward pass for GPT models with nested tensor inputs (no padding).
+
+    Args:
+        data_format: Data format to use. Options:
+            - "thd": Token-Head-Dimension packed sequences (default)
+            - "bshd": Batch-Sequence-Head-Dimension standard format
+    """
+    assert data_format in ["thd", "bshd"], f"data_format must be 'thd' or 'bshd', got '{data_format}'"
+
     pre_process = unwrap_model(model).pre_process
     post_process = unwrap_model(model).post_process
 
@@ -207,34 +223,68 @@ def gptmodel_forward_no_padding(
         model_kwargs["pixel_values"] = multi_modal_inputs["pixel_values"].to(input_ids.device)
     if "image_grid_thw" in multi_modal_inputs:
         model_kwargs["image_grid_thw"] = multi_modal_inputs["image_grid_thw"].to(input_ids.device)
+    if "pixel_values_videos" in multi_modal_inputs:
+        model_kwargs["pixel_values_videos"] = multi_modal_inputs["pixel_values_videos"].to(input_ids.device)
+    if "video_grid_thw" in multi_modal_inputs:
+        model_kwargs["video_grid_thw"] = multi_modal_inputs["video_grid_thw"].to(input_ids.device)
 
     batch_size = input_ids.shape[0]
-    input_ids_rmpad, packed_seq_params = preprocess_packed_seqs_no_padding(input_ids, pre_process=pre_process)
-    input_ids_rmpad = input_ids_rmpad.contiguous()
-    output_orig = model(
-        input_ids=input_ids_rmpad,
-        attention_mask=None,
-        position_ids=None,
-        packed_seq_params=packed_seq_params,
-        **model_kwargs,
-    )
 
-    if post_process and logits_processor is not None:
-        args = {
-            k: preprocess_packed_seqs_no_padding(v, pre_process=True, need_roll=(k == "label"))[0]
-            for k, v in logits_processor_args.items()
-        }
-        output_dict = logits_processor(output_orig, **args)
-        output = {
-            k: postprocess_packed_seqs_no_padding(
-                v, packed_seq_params, input_ids, batch_size, post_process=post_process
-            )
-            for k, v in output_dict.items()
-        }
-    else:
-        output = postprocess_packed_seqs_no_padding(
-            output_orig, packed_seq_params, input_ids, batch_size, post_process=post_process
+    if data_format == "thd":
+        # THD format path (packed sequences)
+        input_ids_rmpad, packed_seq_params = preprocess_thd_no_padding(input_ids, pre_process=pre_process)
+        input_ids_rmpad = input_ids_rmpad.contiguous()
+        output_orig = model(
+            input_ids=input_ids_rmpad,
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=packed_seq_params,
+            **model_kwargs,
         )
+
+        if post_process and logits_processor is not None:
+            args = {
+                k: preprocess_thd_no_padding(v, pre_process=True, need_roll=(k == "label"))[0]
+                for k, v in logits_processor_args.items()
+            }
+            output_dict = logits_processor(output_orig, **args)
+            output = {
+                k: postprocess_thd_no_padding(
+                    v, packed_seq_params, input_ids, batch_size, post_process=post_process
+                )
+                for k, v in output_dict.items()
+            }
+        else:
+            output = postprocess_thd_no_padding(
+                output_orig, packed_seq_params, input_ids, batch_size, post_process=post_process
+            )
+    else:  # data_format == "bshd"
+        # BSHD format path (standard attention mask format)
+        input_ids_bshd, attention_mask, position_ids = preprocess_bshd_no_padding(
+            input_ids, pre_process=pre_process
+        )
+        output_orig = model(
+            input_ids=input_ids_bshd,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=None,
+            **model_kwargs,
+        )
+
+        if post_process and logits_processor is not None:
+            args = {}
+            for k, v in logits_processor_args.items():
+                v_bshd, _, _ = preprocess_bshd_no_padding(v, pre_process=True, need_roll=(k == "label"))
+                args[k] = v_bshd
+            output_dict = logits_processor(output_orig, **args)
+            output = {
+                k: postprocess_bshd_no_padding(v, attention_mask, post_process=post_process)
+                for k, v in output_dict.items()
+            }
+        else:
+            output = postprocess_bshd_no_padding(
+                output_orig, attention_mask, post_process=post_process
+            )
 
     if value_model and post_process:
         # output = output[..., 0]

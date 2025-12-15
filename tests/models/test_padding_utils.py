@@ -13,10 +13,13 @@
 # limitations under the License.
 
 """
-Unit tests for remove_left_padding and recover_left_padding utilities.
+Unit tests for preprocess_bshd and postprocess_bshd utilities.
 
 These tests verify that the padding conversion functions work correctly
 in isolation, without requiring a full distributed environment.
+
+Note: Tests import via backward compatibility aliases (remove_left_padding/recover_left_padding)
+      which map to preprocess_bshd/postprocess_bshd.
 
 Run with:
     python -m pytest tests/models/test_padding_utils.py -v

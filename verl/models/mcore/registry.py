@@ -243,9 +243,11 @@ def get_mcore_forward_fn(hf_config: PretrainedConfig, use_sequence_packing: bool
     Args:
         hf_config: HuggingFace model configuration.
         use_sequence_packing: Whether to use sequence packing (THD format).
-            If True (default), uses packed sequences for efficient attention.
-            If False, uses standard BSHD format with attention masks.
-            Note: Context Parallelism and fused kernels require packing=True.
+            If True (default), uses packed sequences (data_format="thd").
+            If False, uses standard BSHD format (data_format="bshd").
+
+    Returns:
+        A forward function that accepts data_format or uses the specified default.
     """
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
     model = get_supported_model(hf_config.architectures[0])
@@ -254,17 +256,48 @@ def get_mcore_forward_fn(hf_config: PretrainedConfig, use_sequence_packing: bool
     vision_models = {SupportedModel.QWEN2_5_VL, SupportedModel.QWEN3_MOE_VL, SupportedModel.QWEN3_VL}
     is_vision_model = model in vision_models
 
-    # Generate forward function with specified packing mode
-    return model_forward_gen(vision_model=is_vision_model, use_sequence_packing=use_sequence_packing)
+    # Generate base forward function
+    base_forward_fn = model_forward_gen(vision_model=is_vision_model)
+
+    # Convert use_sequence_packing to data_format
+    default_data_format = "thd" if use_sequence_packing else "bshd"
+
+    # Create wrapper that sets default data_format while preserving the ability to override
+    def wrapped_forward(*args, data_format: str = None, **kwargs):
+        if data_format is None:
+            data_format = default_data_format
+        return base_forward_fn(*args, data_format=data_format, **kwargs)
+
+    return wrapped_forward
 
 
-def get_mcore_forward_no_padding_fn(hf_config: PretrainedConfig) -> Callable:
+def get_mcore_forward_no_padding_fn(hf_config: PretrainedConfig, use_sequence_packing: bool = True) -> Callable:
     """
-    Get the forward function for given model architecture.
+    Get the forward function for given model architecture with nested tensor inputs.
+
+    Args:
+        hf_config: HuggingFace model configuration.
+        use_sequence_packing: Whether to use sequence packing (THD format).
+            If True (default), uses packed sequences (data_format="thd").
+            If False, uses standard BSHD format (data_format="bshd").
+
+    Returns:
+        A forward function that accepts data_format or uses the specified default.
     """
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
     model = get_supported_model(hf_config.architectures[0])
-    return MODEL_FORWARD_NOPAD_REGISTRY[model]
+    base_forward_fn = MODEL_FORWARD_NOPAD_REGISTRY[model]
+
+    # Convert use_sequence_packing to data_format
+    default_data_format = "thd" if use_sequence_packing else "bshd"
+
+    # Create wrapper that sets default data_format while preserving the ability to override
+    def wrapped_forward(*args, data_format: str = None, **kwargs):
+        if data_format is None:
+            data_format = default_data_format
+        return base_forward_fn(*args, data_format=data_format, **kwargs)
+
+    return wrapped_forward
 
 
 def get_mcore_forward_fused_fn(hf_config: PretrainedConfig) -> Callable:
