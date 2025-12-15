@@ -77,7 +77,92 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+def _compute_per_prompt_metrics(
+    uids: np.ndarray,
+    scores: np.ndarray,
+    acc_values: np.ndarray | None,
+    n_samples: int,
+) -> dict[str, float]:
+    """
+    Compute pass@k and max@k metrics for different k values.
+
+    This function groups samples by their unique identifier (UID) and computes
+    per-prompt statistics that are commonly used in code generation and reasoning tasks.
+
+    Args:
+        uids: Array of unique identifiers for each sample. Samples with the same UID
+            belong to the same prompt.
+        scores: Array of scores for each sample (e.g., sequence-level rewards).
+        acc_values: Optional array of accuracy values (0 or 1) for each sample.
+            If provided, pass@k is computed. If None, pass@k is skipped.
+        n_samples: Expected number of samples per prompt (rollout.n).
+
+    Returns:
+        A dictionary of metrics including:
+            - critic/score/max@k: Mean of per-prompt max scores for sample size k
+            - critic/acc/pass@k: Mean of per-prompt pass@k values (if acc_values provided)
+
+        Where k = 2, 4, 8, ..., n_samples
+    """
+    from scipy.special import comb
+
+    # Group by UID
+    uid2scores: dict[str, list[float]] = defaultdict(list)
+    uid2accs: dict[str, list[float]] = defaultdict(list)
+    for i, uid in enumerate(uids):
+        uid2scores[uid].append(scores[i])
+        if acc_values is not None:
+            uid2accs[uid].append(acc_values[i])
+
+    # Compute for different k values: 2, 4, 8, ..., n
+    ks = []
+    k = 2
+    while k < n_samples:
+        ks.append(k)
+        k *= 2
+    ks.append(n_samples)
+
+    metrics: dict[str, float] = {}
+    for k in ks:
+        max_at_k_list = []
+        pass_at_k_list = []
+
+        for uid in uid2scores:
+            prompt_scores = uid2scores[uid]
+            n = len(prompt_scores)
+
+            # max@k: maximum score among k samples
+            if n >= k:
+                max_at_k_list.append(np.max(prompt_scores[:k]))
+
+            # pass@k: probability that at least one of k samples is correct
+            # Formula: 1 - C(n-c, k) / C(n, k) where c = number of correct samples
+            if n >= k and acc_values is not None:
+                prompt_accs = uid2accs[uid]
+                c = int(sum(prompt_accs))  # number of correct samples
+                if c >= n:  # all correct
+                    pass_at_k = 1.0
+                elif c == 0:  # none correct
+                    pass_at_k = 0.0
+                else:
+                    pass_at_k = 1.0 - comb(n - c, k, exact=True) / comb(n, k, exact=True)
+                pass_at_k_list.append(pass_at_k)
+
+        if max_at_k_list:
+            metrics[f"critic/score/max@{k}"] = float(np.mean(max_at_k_list))
+        if pass_at_k_list:
+            metrics[f"critic/acc/pass@{k}"] = float(np.mean(pass_at_k_list))
+
+    return metrics
+
+
+def compute_data_metrics(
+    batch: DataProto,
+    use_critic: bool = True,
+    uids: np.ndarray | None = None,
+    n_samples_per_prompt: int = 1,
+    acc_values: np.ndarray | None = None,
+) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -88,6 +173,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     Args:
         batch: A DataProto object containing batch data with token-level scores, rewards, advantages, etc.
         use_critic: Whether to include critic-specific metrics. Defaults to True.
+        uids: Optional array of unique identifiers for per-prompt grouping. If provided along with
+            n_samples_per_prompt > 1, computes pass@k and max@k metrics.
+        n_samples_per_prompt: Number of samples generated per prompt (rollout.n). Used for
+            per-prompt statistics computation.
+        acc_values: Optional array of accuracy values (0 or 1) for computing pass@k metrics.
+            Typically from reward_extra_info["acc"].
 
     Returns:
         A dictionary of metrics including:
@@ -100,6 +191,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
+            - critic/score/max@k: Per-prompt max score statistics (if uids provided)
+            - critic/acc/pass@k: Per-prompt pass@k statistics (if uids and acc_values provided)
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
@@ -220,6 +313,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    # Per-prompt statistics (pass@k, max@k)
+    if uids is not None and n_samples_per_prompt > 1:
+        per_prompt_metrics = _compute_per_prompt_metrics(
+            uids=uids,
+            scores=sequence_score.detach().cpu().numpy(),
+            acc_values=acc_values,
+            n_samples=n_samples_per_prompt,
+        )
+        metrics.update(per_prompt_metrics)
 
     return metrics
 

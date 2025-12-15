@@ -1430,7 +1430,17 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # Extract acc values for pass@k computation (from reward_extra_info)
+                acc_values = batch.non_tensor_batch.get("acc", None)
+                metrics.update(
+                    compute_data_metrics(
+                        batch=batch,
+                        use_critic=self.use_critic,
+                        uids=batch.non_tensor_batch.get("uid"),
+                        n_samples_per_prompt=self.config.actor_rollout_ref.rollout.n,
+                        acc_values=acc_values,
+                    )
+                )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
