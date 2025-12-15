@@ -63,8 +63,6 @@ echo "Running transferqueue with ${ACTOR_STRATEGY} strategy"
 echo "Total GPUs: ${NUM_GPUS}"
 
 # Common parameters for both FSDP and Megatron
-# For Ascend NPU, please add
-# trainer.device=npu
 common_params=(
     data.train_files="${HOME}/data/gsm8k/train.parquet"
     data.val_files="${HOME}/data/gsm8k/test.parquet"
@@ -122,8 +120,6 @@ common_params=(
     trainer.total_training_steps=2
     trainer.total_epochs=15
     trainer.val_before_train=True
-    +trainer.num_global_batch=1
-    +trainer.num_data_storage_units=8
 )
 
 if [ "${ACTOR_STRATEGY}" == "fsdp" ]; then

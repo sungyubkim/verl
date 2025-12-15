@@ -70,6 +70,7 @@ class SupportedModel(Enum):
     QWEN3_TOKEN_CLASSIFICATION = "Qwen3ForTokenClassification"
     QWEN3_MOE_VL = "Qwen3VLMoeForConditionalGeneration"
     QWEN3_VL = "Qwen3VLForConditionalGeneration"
+    GPT_OSS = "GptOssForCausalLM"
 
 
 # Registry for model configuration converters
