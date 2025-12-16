@@ -612,6 +612,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After rollout init", logger=logger)
 
         if self._is_ref:
+            # R3 mode: inject router_replay config into ref config
+            if self.enable_routing_replay:
+                self.config.ref.router_replay = self.config.actor.router_replay
+
             self.ref_module, self.ref_model_config = self._build_model_optimizer(
                 model_path=self.config.model.path,
                 optim_config=None,
