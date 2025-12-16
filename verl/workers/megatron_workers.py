@@ -288,7 +288,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         only_rollout = self._is_rollout and not self._is_actor
 
         self.enable_routing_replay = False
-        if self._is_actor:
+        if self._is_actor or self._is_ref:
             self.router_replay = self.config.actor.router_replay
             self.enable_routing_replay = self.router_replay.mode != "disabled"
 
@@ -831,7 +831,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
+
+        # R3 모드: Router Replay 적용
+        if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
         output, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+
+        # R3 모드: Router Replay 정리
+        if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
+            RouterReplay.clear_global_indices()
+            RouterReplay.clear_global_router_replay_action()
+
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
         output = output.to("cpu")
         if self._ref_is_offload_param:
