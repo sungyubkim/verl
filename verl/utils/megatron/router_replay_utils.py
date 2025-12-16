@@ -210,7 +210,91 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
 
 
-def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
+def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel=False):
+    """
+    BSHD format router indices preprocessing. Applies CP/SP processing logic similar to preprocess_bshd.
+
+    Args:
+        layers_topk_idx: [bs, max_seq_len, layer_num, topk]
+        attention_mask: [bs, max_seq_len]
+        sequence_parallel: Whether sequence parallelism is enabled (used for alignment calculation)
+
+    Returns:
+        [bs, seq_len_per_gpu, layer_num, topk] - CP split + alignment applied indices
+    """
+    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank()
+
+    batch_size, max_seq_len = attention_mask.shape
+    seq_lens = attention_mask.sum(dim=1)
+    seq_len = seq_lens.max().item()
+
+    # Alignment calculation (same logic as preprocess_bshd)
+    if cp_size > 1:
+        sp_world_size = mpu.get_tensor_model_parallel_world_size() if sequence_parallel else 1
+        alignment = cp_size * 2 * max(64, sp_world_size)
+    elif sequence_parallel:
+        sp_world_size = mpu.get_tensor_model_parallel_world_size()
+        alignment = sp_world_size
+    else:
+        alignment = 64
+
+    pad_size = (alignment - seq_len % alignment) % alignment
+    seq_len_padded = seq_len + pad_size
+
+    if cp_size > 1:
+        seq_len_per_gpu = seq_len_padded // cp_size
+    else:
+        seq_len_per_gpu = seq_len_padded
+
+    # Initialize output tensor
+    layer_num, topk = layers_topk_idx.shape[2], layers_topk_idx.shape[3]
+    result = torch.zeros(
+        batch_size,
+        seq_len_per_gpu,
+        layer_num,
+        topk,
+        dtype=layers_topk_idx.dtype,
+        device=layers_topk_idx.device,
+    )
+
+    for i in range(batch_size):
+        valid_len = seq_lens[i].item()
+
+        # Extract original data (valid tokens only)
+        orig_indices = layers_topk_idx[i, attention_mask[i].bool()]  # [valid_len, layer_num, topk]
+
+        if cp_size <= 1:
+            # Simple right-padding conversion
+            copy_len = min(valid_len, seq_len_per_gpu)
+            result[i, :copy_len] = orig_indices[:copy_len]
+        else:
+            # CP chunk splitting (same pattern as preprocess_bshd)
+            chunk_size = seq_len_padded // (cp_size * 2)
+            half_seq = seq_len_per_gpu // 2
+
+            # First chunk: chunk[cp_rank]
+            first_start = chunk_size * cp_rank
+            first_end = min(first_start + chunk_size, valid_len)
+            first_len = max(0, first_end - first_start)
+            if first_len > 0:
+                result[i, :first_len] = orig_indices[first_start:first_end]
+
+            # Second chunk: chunk[-(cp_rank+1)]
+            second_start = seq_len_padded - chunk_size * (cp_rank + 1)
+            second_end = seq_len_padded - chunk_size * cp_rank
+            second_start = max(0, min(second_start, valid_len))
+            second_end = max(0, min(second_end, valid_len))
+            second_len = max(0, second_end - second_start)
+            if second_len > 0:
+                result[i, half_seq : half_seq + second_len] = orig_indices[second_start:second_end]
+
+    return result.to(device_name)
+
+
+def set_router_replay_data(
+    layers_topk_idx, attention_mask, tf_config, vp_rank=None, use_sequence_packing=True, sequence_parallel=False
+):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
     RouterReplay instance with target indices for replay mode.
@@ -225,19 +309,46 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
         tf_config: Megatron/Transformer engine configuration object.
         vp_rank (Optional[int]): Virtual pipeline stage rank override. If None, the current VP rank from
             Megatron parallel state will be used.
+        use_sequence_packing (bool): If True, use THD (packed sequences) format. If False, use BSHD format.
+            Defaults to True for backward compatibility.
+        sequence_parallel (bool): Whether sequence parallelism is enabled. Used for BSHD format to apply
+            SP scatter. Defaults to False.
 
     Returns:
         None: The function updates internal RouterReplay instances in-place.
     """
     with torch.no_grad():
-        layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
-        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
+        if use_sequence_packing:
+            # Existing THD logic
+            layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
+            layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
 
-        # 1, dynamic_bs_split, layer_num, topk
-        layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
-            layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
-        ).unsqueeze(dim=0)
+            # 1, dynamic_bs_split, layer_num, topk
+            layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
+                layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
+            ).unsqueeze(dim=0)
+        else:
+            # BSHD logic (new)
+            layers_topk_idx_split = _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel)
 
+            # BSHD: [batch, seq_per_gpu, layer_num, topk]
+            # Router receives [seq, batch, hidden] and does view(-1, num_experts)
+            # So we need to flatten in the same order: transpose then flatten
+            # [batch, seq_per_gpu, layer_num, topk] -> [seq_per_gpu, batch, layer_num, topk]
+            layers_topk_idx_transposed = layers_topk_idx_split.transpose(0, 1)
+
+            # Apply SP scatter (if SP is enabled)
+            if sequence_parallel:
+                # [seq_per_gpu, batch, layer_num, topk] -> [seq_per_gpu // sp, batch, layer_num, topk]
+                layers_topk_idx_transposed = scatter_to_sequence_parallel_region(layers_topk_idx_transposed)
+
+            # Flatten: [seq_per_gpu // sp * batch, layer_num, topk]
+            seq_per_gpu_sp, batch_size = layers_topk_idx_transposed.shape[:2]
+            layers_topk_idx_rmpad_split = layers_topk_idx_transposed.reshape(
+                1, seq_per_gpu_sp * batch_size, -1, layers_topk_idx_split.shape[-1]
+            )
+
+        # Common: set indices for each router
         # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
         layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
             dim=0

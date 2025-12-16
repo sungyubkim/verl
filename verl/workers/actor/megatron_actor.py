@@ -640,7 +640,14 @@ class MegatronPPOActor(BasePPOActor):
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 layers_topk_idx = batch["routed_experts"]
-                set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config, vp_rank)
+                set_router_replay_data(
+                    layers_topk_idx,
+                    attention_mask,
+                    self.tf_config,
+                    vp_rank,
+                    use_sequence_packing=self.use_sequence_packing,
+                    sequence_parallel=self.tf_config.sequence_parallel,
+                )
 
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
 
