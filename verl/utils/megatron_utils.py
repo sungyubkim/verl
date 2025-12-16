@@ -275,6 +275,8 @@ def make_megatron_module(
 
                 ddp_config_dict = {
                     "use_distributed_optimizer": wrap_config.use_distributed_optimizer,
+                    "grad_reduce_in_fp32": True,
+                    "overlap_grad_reduce": False,
                 }
                 # Apply any DDP config overrides
                 if override_ddp_config is not None:
@@ -295,12 +297,19 @@ def make_megatron_module(
             # Extract TransformerConfig from the created model
             tf_config = get_model_config(model[0] if isinstance(model, list) else model)
         else:
+            # Ensure grad_reduce_in_fp32 is set for fp16 training
+            effective_ddp_config = {
+                "grad_reduce_in_fp32": True,
+                "overlap_grad_reduce": False,
+            }
+            if override_ddp_config is not None:
+                effective_ddp_config.update(override_ddp_config)
             model = bridge.get_model(
                 post_model_creation_callbacks=post_model_creation_callbacks,
                 wrap_with_ddp=wrap_config.wrap_with_ddp,
                 fp16=tf_config.fp16,
                 bf16=tf_config.bf16,
-                ddp_config=override_ddp_config,
+                ddp_config=effective_ddp_config,
             )
     else:
 
