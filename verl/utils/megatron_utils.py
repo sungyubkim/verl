@@ -288,6 +288,8 @@ def make_megatron_module(
             model = provider.provide_distributed_model(
                 wrap_with_ddp=wrap_config.wrap_with_ddp,
                 ddp_config=ddp_config,
+                fp16=provider.params_dtype == torch.float16,
+                bf16=provider.params_dtype == torch.bfloat16,
             )
 
             # Extract TransformerConfig from the created model
