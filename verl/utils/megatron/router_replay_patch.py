@@ -179,16 +179,23 @@ def _patched_topk_routing_with_score_function(
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
 
-            # Handle padding tokens in BSHD mode
-            # Padding positions are marked with 255 (sentinel value for uint8 dtype)
-            # Note: use < 255 instead of >= 0 because uint8 doesn't support negative values
+            # Handle padding tokens and unrecorded tokens
+            # 1. Padding: marked with 255 (sentinel value for uint8 dtype in BSHD mode)
+            # 2. Unrecorded: vLLM R3 only records response tokens, prompt tokens have [0,0,0,0]
+            #    Note: [0,0,0,0] is impossible for topk>=2 since torch.topk returns distinct indices
             PADDING_EXPERT_IDX = 255
-            valid_mask = (top_indices < PADDING_EXPERT_IDX).all(dim=-1)  # [num_tokens]
+            is_padding = (top_indices >= PADDING_EXPERT_IDX).all(dim=-1)  # [num_tokens]
+            # Only check for unrecorded when topk > 1 (topk=1 with [0] could be valid expert 0)
+            if topk > 1:
+                is_unrecorded = (top_indices == 0).all(dim=-1)  # [num_tokens]
+            else:
+                is_unrecorded = torch.zeros(top_indices.shape[0], dtype=torch.bool, device=scores.device)
+            valid_mask = ~(is_padding | is_unrecorded)
 
             if not valid_mask.all():
-                # Mixed case: some valid tokens, some padding tokens
-                # For padding tokens, compute regular topk
-                padding_probs, padding_indices = _compute_topk(
+                # Mixed case: some valid tokens, some invalid tokens (padding or unrecorded)
+                # For invalid tokens, compute regular topk
+                fallback_probs, fallback_indices = _compute_topk(
                     scores[~valid_mask], topk, num_groups=num_groups, group_topk=group_topk
                 )
 
@@ -200,9 +207,9 @@ def _patched_topk_routing_with_score_function(
                 probs[valid_mask] = scores[valid_mask].gather(1, top_indices[valid_mask])
                 final_indices[valid_mask] = top_indices[valid_mask]
 
-                # Fill padding tokens with computed topk
-                probs[~valid_mask] = padding_probs
-                final_indices[~valid_mask] = padding_indices
+                # Fill invalid tokens with computed topk
+                probs[~valid_mask] = fallback_probs
+                final_indices[~valid_mask] = fallback_indices
 
                 return probs, final_indices
 
@@ -220,12 +227,17 @@ def _patched_topk_routing_with_score_function(
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
 
-            # Handle padding tokens in BSHD mode (same logic as REPLAY_FORWARD)
+            # Handle padding tokens and unrecorded tokens (same logic as REPLAY_FORWARD)
             PADDING_EXPERT_IDX = 255
-            valid_mask = (top_indices < PADDING_EXPERT_IDX).all(dim=-1)
+            is_padding = (top_indices >= PADDING_EXPERT_IDX).all(dim=-1)
+            if topk > 1:
+                is_unrecorded = (top_indices == 0).all(dim=-1)
+            else:
+                is_unrecorded = torch.zeros(top_indices.shape[0], dtype=torch.bool, device=scores.device)
+            valid_mask = ~(is_padding | is_unrecorded)
 
             if not valid_mask.all():
-                padding_probs, padding_indices = _compute_topk(
+                fallback_probs, fallback_indices = _compute_topk(
                     scores[~valid_mask], topk, num_groups=num_groups, group_topk=group_topk
                 )
 
@@ -235,8 +247,8 @@ def _patched_topk_routing_with_score_function(
                 probs[valid_mask] = scores[valid_mask].gather(1, top_indices[valid_mask])
                 final_indices[valid_mask] = top_indices[valid_mask]
 
-                probs[~valid_mask] = padding_probs
-                final_indices[~valid_mask] = padding_indices
+                probs[~valid_mask] = fallback_probs
+                final_indices[~valid_mask] = fallback_indices
 
                 return probs, final_indices
 
