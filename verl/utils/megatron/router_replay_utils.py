@@ -227,14 +227,15 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
     _debug_rank = mpu.get_tensor_model_parallel_rank() if mpu.is_initialized() else 0
     if _debug_rank == 0:
         valid_mask = attention_mask[0].bool()
-        _sample_input = layers_topk_idx[0, valid_mask][:5] if valid_mask.any() else "NO_VALID"
-        _nonzero_cnt = (layers_topk_idx[0, valid_mask] > 0).sum().item() if valid_mask.any() else 0
+        _valid_cnt = valid_mask.sum().item()
+        _total_nonzero = (layers_topk_idx > 0).sum().item()  # attention_mask 무관하게 전체 체크
+        _valid_nonzero = (layers_topk_idx[0, valid_mask] > 0).sum().item() if valid_mask.any() else 0
+        _first_valid = layers_topk_idx[0, valid_mask][0].tolist() if (valid_mask.any() and _valid_cnt > 0) else "N/A"
         print(
             f"[BSHD DEBUG] _preprocess_router_indices_bshd INPUT | "
-            f"idx.shape={layers_topk_idx.shape}, idx.dtype={layers_topk_idx.dtype}, "
-            f"mask.shape={attention_mask.shape}, mask.dtype={attention_mask.dtype}, "
+            f"idx.shape={layers_topk_idx.shape}, mask.shape={attention_mask.shape}, "
             f"seq_lens={attention_mask.sum(dim=1).tolist()}, "
-            f"sample_valid_input={_sample_input}, nonzero_in_valid={_nonzero_cnt}"
+            f"total_nonzero={_total_nonzero}, valid_nonzero={_valid_nonzero}, first_valid={_first_valid}"
         )
     # === DEBUG END ===
 
@@ -309,11 +310,11 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
     # === DEBUG OUTPUT ===
     if _debug_rank == 0:
         _non_sentinel = (result < 255).sum().item()
-        _sample_out = result[0, :5]
+        _out_nonzero = (result > 0).sum().item()
+        _first_out = result[0, 0].tolist() if result.shape[1] > 0 else "N/A"
         print(
             f"[BSHD DEBUG] _preprocess_router_indices_bshd OUTPUT | "
-            f"result.shape={result.shape}, non_sentinel_cnt={_non_sentinel}, "
-            f"sample_output[0,:5]={_sample_out}"
+            f"result.shape={result.shape}, non_sentinel={_non_sentinel}, out_nonzero={_out_nonzero}, first_out={_first_out}"
         )
     # === DEBUG END ===
 
