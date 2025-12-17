@@ -362,6 +362,25 @@ def set_router_replay_data(
                 layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
             ).unsqueeze(dim=0)
         else:
+            # === DEBUG RAW (vLLM 원본) ===
+            _debug_rank = mpu.get_tensor_model_parallel_rank() if mpu.is_initialized() else 0
+            if _debug_rank == 0:
+                _raw_nz = (layers_topk_idx > 0).sum().item()
+                _valid_mask = attention_mask[0].bool()
+                _raw_valid_data = layers_topk_idx[0, _valid_mask] if _valid_mask.any() else None
+                _raw_valid_nz = (_raw_valid_data > 0).sum().item() if _raw_valid_data is not None else 0
+                _raw_first_v = _raw_valid_data[0, 0, 0].item() if _raw_valid_data is not None and len(_raw_valid_data) > 0 else -1
+                _raw_last_v = _raw_valid_data[-1, 0, 0].item() if _raw_valid_data is not None and len(_raw_valid_data) > 0 else -1
+                _valid_cnt = _valid_mask.sum().item()
+                _token_has_nz = (_raw_valid_data.view(_valid_cnt, -1) > 0).any(dim=1) if _raw_valid_data is not None else None
+                _raw_first_nz_pos = _token_has_nz.int().argmax().item() if (_token_has_nz is not None and _token_has_nz.any()) else -1
+                print(
+                    f"[BSHD DEBUG] RAW | idx={layers_topk_idx.shape}, mask={attention_mask.shape}, "
+                    f"raw_nz={_raw_nz}, valid_nz={_raw_valid_nz}, "
+                    f"first_v={_raw_first_v}, last_v={_raw_last_v}, first_nz_pos={_raw_first_nz_pos}"
+                )
+            # === DEBUG END ===
+
             # BSHD logic: keep all tokens (including padding with sentinel value 255)
             # Unlike THD which packs sequences, BSHD model processes all tokens including padding
             # Router replay patch will handle padding tokens (255) by computing regular topk
