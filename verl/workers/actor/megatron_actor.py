@@ -567,6 +567,18 @@ class MegatronPPOActor(BasePPOActor):
                                 log_lines.append(f"  sample[{i}] non-zero: log_prob={lp_range}, old={old_range}")
                             log_lines.append(f"  total mismatch count: {mismatch_count}")
 
+                        # Add routed_experts info for debugging router replay
+                        if "routed_experts" in data:
+                            re = data["routed_experts"]
+                            # Count unrecorded ([0,0,0,0]) and padding (>=255) tokens
+                            unrecorded = ((re == 0).all(dim=-1)).sum().item()
+                            padding = ((re >= 255).all(dim=-1)).sum().item()
+                            total_tokens = re.shape[0] * re.shape[1]
+                            log_lines.append(
+                                f"  routed_experts: shape={list(re.shape)}, "
+                                f"unrecorded={unrecorded}, padding={padding}, total={total_tokens}"
+                            )
+
                         log_lines.append("=" * 60)
                         print("\n".join(log_lines), flush=True)
 
@@ -640,6 +652,11 @@ class MegatronPPOActor(BasePPOActor):
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 layers_topk_idx = batch["routed_experts"]
+
+                # PP>1: fixed_seq_len for consistent alignment (same as model_forward.py)
+                pp_size = mpu.get_pipeline_model_parallel_world_size()
+                fixed_seq_len = attention_mask.shape[1] if pp_size > 1 else None
+
                 set_router_replay_data(
                     layers_topk_idx,
                     attention_mask,
@@ -647,6 +664,7 @@ class MegatronPPOActor(BasePPOActor):
                     vp_rank,
                     use_sequence_packing=self.use_sequence_packing,
                     sequence_parallel=self.tf_config.sequence_parallel,
+                    fixed_seq_len=fixed_seq_len,
                 )
 
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
@@ -738,6 +756,10 @@ class MegatronPPOActor(BasePPOActor):
                 }
 
             if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):
+                # PP>1: fixed_seq_len for consistent alignment (same as model_forward.py)
+                pp_size = mpu.get_pipeline_model_parallel_world_size()
+                fixed_seq_len = attention_mask.shape[1] if pp_size > 1 else None
+
                 merge_router_topk_indices(
                     attention_mask,
                     input_ids,
@@ -746,6 +768,7 @@ class MegatronPPOActor(BasePPOActor):
                     vp_rank,
                     use_sequence_packing=self.use_sequence_packing,
                     sequence_parallel=self.tf_config.sequence_parallel,
+                    fixed_seq_len=fixed_seq_len,
                 )
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):

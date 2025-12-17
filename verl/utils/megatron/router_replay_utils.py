@@ -175,6 +175,7 @@ def merge_router_topk_indices(
     vp_rank=None,
     use_sequence_packing=True,
     sequence_parallel=False,
+    fixed_seq_len=None,
 ):
     """
     Merge recorded router top-k indices across sequence-parallel ranks for all router instances,
@@ -194,6 +195,8 @@ def merge_router_topk_indices(
             Defaults to True for backward compatibility.
         sequence_parallel (bool): Whether sequence parallelism is enabled. Used for BSHD format.
             Defaults to False.
+        fixed_seq_len (Optional[int]): If provided, use this as the sequence length instead of computing
+            from attention_mask. Required for PP>1 to ensure consistent tensor shapes across micro-batches.
 
     Returns:
         None: The function has side effects only; it appends a tensor of shape
@@ -224,12 +227,14 @@ def merge_router_topk_indices(
             )
         else:
             # BSHD format: use dedicated postprocess function
-            layers_topk_idx = _postprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel)
+            layers_topk_idx = _postprocess_router_indices_bshd(
+                layers_topk_idx, attention_mask, sequence_parallel, fixed_seq_len
+            )
 
         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
 
 
-def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel=False):
+def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel=False, fixed_seq_len=None):
     """
     BSHD format router indices preprocessing. Applies CP/SP processing logic similar to preprocess_bshd.
 
@@ -237,6 +242,8 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
         layers_topk_idx: [bs, max_seq_len, layer_num, topk]
         attention_mask: [bs, max_seq_len]
         sequence_parallel: Whether sequence parallelism is enabled (used for alignment calculation)
+        fixed_seq_len: If provided, use this as the sequence length instead of computing from
+            attention_mask. Required for PP>1 to ensure consistent tensor shapes across micro-batches.
 
     Returns:
         [bs, seq_len_per_gpu, layer_num, topk] - CP split + alignment applied indices
@@ -247,7 +254,13 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
 
     batch_size, max_seq_len = attention_mask.shape
     seq_lens = attention_mask.sum(dim=1)
-    seq_len = seq_lens.max().item()
+
+    # Use fixed_seq_len if provided (for PP>1 to ensure consistent alignment)
+    # Otherwise, compute dynamically from attention_mask
+    if fixed_seq_len is not None:
+        seq_len = fixed_seq_len
+    else:
+        seq_len = seq_lens.max().item()
 
     # Alignment calculation (same logic as preprocess_bshd)
     if cp_size > 1:
@@ -313,7 +326,7 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
     return result.to(device_name)
 
 
-def _postprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel=False):
+def _postprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel=False, fixed_seq_len=None):
     """
     BSHD format router indices postprocessing. Inverse of _preprocess_router_indices_bshd.
 
@@ -323,6 +336,8 @@ def _postprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_p
         layers_topk_idx: [1, seq_per_gpu * batch, layer_num, topk] - flattened format after SP gather
         attention_mask: [bs, max_seq_len]
         sequence_parallel: Whether sequence parallelism is enabled
+        fixed_seq_len: If provided, use this as the sequence length instead of computing from
+            attention_mask. Required for PP>1 to ensure consistent tensor shapes across micro-batches.
 
     Returns:
         [bs, max_seq_len, layer_num, topk] - original layout with left-padding restored
@@ -332,7 +347,13 @@ def _postprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_p
 
     batch_size, max_seq_len = attention_mask.shape
     seq_lens = attention_mask.sum(dim=1)
-    seq_len = seq_lens.max().item()
+
+    # Use fixed_seq_len if provided (for PP>1 to ensure consistent alignment)
+    # Otherwise, compute dynamically from attention_mask
+    if fixed_seq_len is not None:
+        seq_len = fixed_seq_len
+    else:
+        seq_len = seq_lens.max().item()
 
     # Alignment calculation (same logic as _preprocess_router_indices_bshd)
     if cp_size > 1:
@@ -357,6 +378,16 @@ def _postprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_p
     layers_topk_idx = layers_topk_idx.squeeze(0)  # [seq_per_gpu * batch, layer_num, topk]
 
     layer_num, topk = layers_topk_idx.shape[1], layers_topk_idx.shape[2]
+
+    # Validate shape before reshape to catch alignment mismatches early
+    expected_size = seq_per_gpu * batch_size
+    actual_size = layers_topk_idx.shape[0]
+    assert expected_size == actual_size, (
+        f"Shape mismatch in _postprocess_router_indices_bshd: "
+        f"seq_per_gpu={seq_per_gpu}, batch_size={batch_size}, "
+        f"expected={expected_size}, actual={actual_size}. "
+        f"This may indicate alignment mismatch between recording and replay phases."
+    )
 
     # Reshape: [seq_per_gpu * batch, layer_num, topk] -> [seq_per_gpu, batch, layer_num, topk]
     layers_topk_idx = layers_topk_idx.reshape(seq_per_gpu, batch_size, layer_num, topk)
@@ -408,7 +439,13 @@ def _postprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_p
 
 
 def set_router_replay_data(
-    layers_topk_idx, attention_mask, tf_config, vp_rank=None, use_sequence_packing=True, sequence_parallel=False
+    layers_topk_idx,
+    attention_mask,
+    tf_config,
+    vp_rank=None,
+    use_sequence_packing=True,
+    sequence_parallel=False,
+    fixed_seq_len=None,
 ):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
@@ -428,6 +465,8 @@ def set_router_replay_data(
             Defaults to True for backward compatibility.
         sequence_parallel (bool): Whether sequence parallelism is enabled. Used for BSHD format to apply
             SP scatter. Defaults to False.
+        fixed_seq_len (Optional[int]): If provided, use this as the sequence length instead of computing
+            from attention_mask. Required for PP>1 to ensure consistent tensor shapes across micro-batches.
 
     Returns:
         None: The function updates internal RouterReplay instances in-place.
@@ -447,7 +486,7 @@ def set_router_replay_data(
             # Unlike THD which packs sequences, BSHD model processes all tokens including padding
             # Router replay patch will handle padding tokens (255) by computing regular topk
             layers_topk_idx_split = _preprocess_router_indices_bshd(
-                layers_topk_idx, attention_mask, sequence_parallel
+                layers_topk_idx, attention_mask, sequence_parallel, fixed_seq_len
             )
 
             # BSHD: [batch, seq_per_gpu, layer_num, topk]
