@@ -228,14 +228,18 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
     if _debug_rank == 0:
         valid_mask = attention_mask[0].bool()
         _valid_cnt = valid_mask.sum().item()
-        _total_nonzero = (layers_topk_idx > 0).sum().item()  # attention_mask 무관하게 전체 체크
-        _valid_nonzero = (layers_topk_idx[0, valid_mask] > 0).sum().item() if valid_mask.any() else 0
-        _first_valid = layers_topk_idx[0, valid_mask][0].tolist() if (valid_mask.any() and _valid_cnt > 0) else "N/A"
+        _total_nonzero = (layers_topk_idx > 0).sum().item()
+        _valid_data = layers_topk_idx[0, valid_mask] if valid_mask.any() else None
+        _valid_nonzero = (_valid_data > 0).sum().item() if _valid_data is not None else 0
+        _first_v = _valid_data[0, 0, 0].item() if _valid_data is not None and len(_valid_data) > 0 else -1
+        _last_v = _valid_data[-1, 0, 0].item() if _valid_data is not None and len(_valid_data) > 0 else -1
+        # Find first token with any non-zero value
+        _token_has_nonzero = (_valid_data.view(_valid_cnt, -1) > 0).any(dim=1) if _valid_data is not None else None
+        _first_nz_pos = _token_has_nonzero.int().argmax().item() if (_token_has_nonzero is not None and _token_has_nonzero.any()) else -1
         print(
-            f"[BSHD DEBUG] _preprocess_router_indices_bshd INPUT | "
-            f"idx.shape={layers_topk_idx.shape}, mask.shape={attention_mask.shape}, "
-            f"seq_lens={attention_mask.sum(dim=1).tolist()}, "
-            f"total_nonzero={_total_nonzero}, valid_nonzero={_valid_nonzero}, first_valid={_first_valid}"
+            f"[BSHD DEBUG] INPUT | idx={layers_topk_idx.shape}, seq_lens={attention_mask.sum(dim=1).tolist()}, "
+            f"total_nz={_total_nonzero}, valid_nz={_valid_nonzero}, "
+            f"first_v={_first_v}, last_v={_last_v}, first_nz_pos={_first_nz_pos}"
         )
     # === DEBUG END ===
 
@@ -311,10 +315,11 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
     if _debug_rank == 0:
         _non_sentinel = (result < 255).sum().item()
         _out_nonzero = (result > 0).sum().item()
-        _first_out = result[0, 0].tolist() if result.shape[1] > 0 else "N/A"
+        _first_out = result[0, 0, 0, 0].item() if result.shape[1] > 0 else -1
+        _last_out = result[0, -1, 0, 0].item() if result.shape[1] > 0 else -1
         print(
-            f"[BSHD DEBUG] _preprocess_router_indices_bshd OUTPUT | "
-            f"result.shape={result.shape}, non_sentinel={_non_sentinel}, out_nonzero={_out_nonzero}, first_out={_first_out}"
+            f"[BSHD DEBUG] OUTPUT | result={result.shape}, non_sent={_non_sentinel}, "
+            f"out_nz={_out_nonzero}, first_out={_first_out}, last_out={_last_out}"
         )
     # === DEBUG END ===
 
@@ -384,15 +389,15 @@ def set_router_replay_data(
             # === DEBUG BSHD ===
             _debug_rank = mpu.get_tensor_model_parallel_rank() if mpu.is_initialized() else 0
             if _debug_rank == 0:
-                _sample_final = layers_topk_idx_rmpad_split[0, :5, 0, :]  # [5, topk] for layer 0
                 _non_sentinel_final = (layers_topk_idx_rmpad_split < 255).sum().item()
+                _final_nz = (layers_topk_idx_rmpad_split > 0).sum().item()
+                _first_final = layers_topk_idx_rmpad_split[0, 0, 0, 0].item()
+                _last_final = layers_topk_idx_rmpad_split[0, -1, 0, 0].item()
                 print(
-                    f"[BSHD DEBUG] set_router_replay_data FINAL | "
-                    f"after_transpose={layers_topk_idx_split.transpose(0,1).shape}, "
-                    f"seq_parallel={sequence_parallel}, "
-                    f"final_shape={layers_topk_idx_rmpad_split.shape}, "
-                    f"non_sentinel={_non_sentinel_final}, "
-                    f"sample_final[layer0,:5]={_sample_final.tolist()}"
+                    f"[BSHD DEBUG] FINAL | transpose={layers_topk_idx_split.transpose(0,1).shape}, "
+                    f"sp={sequence_parallel}, final={layers_topk_idx_rmpad_split.shape}, "
+                    f"non_sent={_non_sentinel_final}, final_nz={_final_nz}, "
+                    f"first={_first_final}, last={_last_final}"
                 )
             # === DEBUG END ===
 
