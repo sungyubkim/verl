@@ -866,7 +866,14 @@ class MegatronPPOActor(BasePPOActor):
                 # allgather already execute in optimizer.step in new megatron
                 pass
             else:
-                raise NotImplementedError
+                # Gradient overflow detected, skip this step
+                # Dynamic loss scaler already adjusted the scale in optimizer.step()
+                from verl.utils.logger import print_rank_0
+
+                print_rank_0(
+                    "Gradient overflow detected, skipping optimizer step. "
+                    "Loss scale has been automatically adjusted."
+                )
             if self.use_torch_profiler and self.prof and self.prof.enable:
                 self.prof.step()
 

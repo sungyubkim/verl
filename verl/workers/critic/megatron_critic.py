@@ -324,7 +324,14 @@ class MegatronPPOCritic(BasePPOCritic):
                 # allgather already execute in optimizer.step in new megatron
                 pass
             else:
-                raise NotImplementedError
+                # Gradient overflow detected, skip this step
+                # Dynamic loss scaler already adjusted the scale in optimizer.step()
+                from verl.utils.logger import print_rank_0
+
+                print_rank_0(
+                    "Gradient overflow detected, skipping optimizer step. "
+                    "Loss scale has been automatically adjusted."
+                )
 
             for metric in metric_micro_batch:
                 append_to_dict(metrics, metric)  # append the metric from this micro-batch to global metrics.
