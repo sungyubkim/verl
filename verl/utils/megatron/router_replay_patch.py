@@ -179,7 +179,34 @@ def _patched_topk_routing_with_score_function(
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
 
-            # Gather the scores for the replayed indices to get the probabilities
+            # Handle padding tokens in BSHD mode
+            # Padding positions are marked with 255 (sentinel value for uint8 dtype)
+            # Note: use < 255 instead of >= 0 because uint8 doesn't support negative values
+            PADDING_EXPERT_IDX = 255
+            valid_mask = (top_indices < PADDING_EXPERT_IDX).all(dim=-1)  # [num_tokens]
+
+            if not valid_mask.all():
+                # Mixed case: some valid tokens, some padding tokens
+                # For padding tokens, compute regular topk
+                padding_probs, padding_indices = _compute_topk(
+                    scores[~valid_mask], topk, num_groups=num_groups, group_topk=group_topk
+                )
+
+                # Prepare output tensors
+                probs = torch.empty_like(scores[:, :topk])
+                final_indices = torch.empty_like(top_indices)
+
+                # Fill valid tokens with replay data
+                probs[valid_mask] = scores[valid_mask].gather(1, top_indices[valid_mask])
+                final_indices[valid_mask] = top_indices[valid_mask]
+
+                # Fill padding tokens with computed topk
+                probs[~valid_mask] = padding_probs
+                final_indices[~valid_mask] = padding_indices
+
+                return probs, final_indices
+
+            # All valid case: use replay indices directly
             probs = scores.gather(1, top_indices)
             return probs, top_indices
 
@@ -192,7 +219,27 @@ def _patched_topk_routing_with_score_function(
             top_indices = router_replay.replay_backward_list.pop(0)
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
+
+            # Handle padding tokens in BSHD mode (same logic as REPLAY_FORWARD)
+            PADDING_EXPERT_IDX = 255
+            valid_mask = (top_indices < PADDING_EXPERT_IDX).all(dim=-1)
+
+            if not valid_mask.all():
+                padding_probs, padding_indices = _compute_topk(
+                    scores[~valid_mask], topk, num_groups=num_groups, group_topk=group_topk
+                )
+
+                probs = torch.empty_like(scores[:, :topk])
+                final_indices = torch.empty_like(top_indices)
+
+                probs[valid_mask] = scores[valid_mask].gather(1, top_indices[valid_mask])
+                final_indices[valid_mask] = top_indices[valid_mask]
+
+                probs[~valid_mask] = padding_probs
+                final_indices[~valid_mask] = padding_indices
+
+                return probs, final_indices
+
             probs = scores.gather(1, top_indices)
             return probs, top_indices
         else:  # Unknown action, fallback
