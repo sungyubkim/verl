@@ -179,11 +179,6 @@ def _patched_topk_routing_with_score_function(
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
 
-            # Debug logging
-            print(f"[DEBUG REPLAY_FORWARD] scores.shape: {scores.shape}, top_indices.shape: {top_indices.shape}")
-            if scores.shape[0] != top_indices.shape[0]:
-                print(f"[DEBUG REPLAY_FORWARD] MISMATCH! scores tokens: {scores.shape[0]}, indices tokens: {top_indices.shape[0]}")
-
             # Gather the scores for the replayed indices to get the probabilities
             probs = scores.gather(1, top_indices)
             return probs, top_indices
