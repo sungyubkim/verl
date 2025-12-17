@@ -223,6 +223,21 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
         [bs, seq_len_per_gpu, layer_num, topk] - CP split + alignment applied indices
         Padding positions are filled with 255 (sentinel value for uint8 dtype)
     """
+    # === DEBUG INPUT ===
+    _debug_rank = mpu.get_tensor_model_parallel_rank() if mpu.is_initialized() else 0
+    if _debug_rank == 0:
+        valid_mask = attention_mask[0].bool()
+        _sample_input = layers_topk_idx[0, valid_mask][:5] if valid_mask.any() else "NO_VALID"
+        _nonzero_cnt = (layers_topk_idx[0, valid_mask] > 0).sum().item() if valid_mask.any() else 0
+        print(
+            f"[BSHD DEBUG] _preprocess_router_indices_bshd INPUT | "
+            f"idx.shape={layers_topk_idx.shape}, idx.dtype={layers_topk_idx.dtype}, "
+            f"mask.shape={attention_mask.shape}, mask.dtype={attention_mask.dtype}, "
+            f"seq_lens={attention_mask.sum(dim=1).tolist()}, "
+            f"sample_valid_input={_sample_input}, nonzero_in_valid={_nonzero_cnt}"
+        )
+    # === DEBUG END ===
+
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
 
@@ -291,6 +306,17 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
             if second_len > 0:
                 result[i, half_seq : half_seq + second_len] = orig_indices[second_start:second_end]
 
+    # === DEBUG OUTPUT ===
+    if _debug_rank == 0:
+        _non_sentinel = (result < 255).sum().item()
+        _sample_out = result[0, :5]
+        print(
+            f"[BSHD DEBUG] _preprocess_router_indices_bshd OUTPUT | "
+            f"result.shape={result.shape}, non_sentinel_cnt={_non_sentinel}, "
+            f"sample_output[0,:5]={_sample_out}"
+        )
+    # === DEBUG END ===
+
     return result.to(device_name)
 
 
@@ -353,6 +379,21 @@ def set_router_replay_data(
             layers_topk_idx_rmpad_split = layers_topk_idx_transposed.reshape(
                 1, seq_per_gpu_sp * batch_size_local, -1, layers_topk_idx_split.shape[-1]
             )
+
+            # === DEBUG BSHD ===
+            _debug_rank = mpu.get_tensor_model_parallel_rank() if mpu.is_initialized() else 0
+            if _debug_rank == 0:
+                _sample_final = layers_topk_idx_rmpad_split[0, :5, 0, :]  # [5, topk] for layer 0
+                _non_sentinel_final = (layers_topk_idx_rmpad_split < 255).sum().item()
+                print(
+                    f"[BSHD DEBUG] set_router_replay_data FINAL | "
+                    f"after_transpose={layers_topk_idx_split.transpose(0,1).shape}, "
+                    f"seq_parallel={sequence_parallel}, "
+                    f"final_shape={layers_topk_idx_rmpad_split.shape}, "
+                    f"non_sentinel={_non_sentinel_final}, "
+                    f"sample_final[layer0,:5]={_sample_final.tolist()}"
+                )
+            # === DEBUG END ===
 
         # Common: set indices for each router
         # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
