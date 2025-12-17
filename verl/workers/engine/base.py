@@ -121,7 +121,7 @@ class BaseEngine:
         self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
         grad_norm = self.optimizer_step()
-        if self.is_mp_src_rank_with_outputs():
+        if self.is_mp_src_rank_with_outputs() and grad_norm is not None:
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
         return outputs

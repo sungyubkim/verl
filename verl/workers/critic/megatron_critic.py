@@ -317,8 +317,9 @@ class MegatronPPOCritic(BasePPOCritic):
             metric_micro_batch = metric_micro_batch["output"]
             update_successful, grad_norm, num_zeros_in_grad = self.critic_optimizer.step()
             learning_rate = self.critic_optimizer.param_groups[-1]["lr"]
-            data = {"critic/grad_norm": grad_norm, "critic/lr": learning_rate}
-            append_to_dict(metrics, data)
+            if grad_norm is not None:
+                data = {"critic/grad_norm": grad_norm, "critic/lr": learning_rate}
+                append_to_dict(metrics, data)
 
             if update_successful:
                 # allgather already execute in optimizer.step in new megatron
