@@ -167,7 +167,15 @@ def get_num_layers_to_build(
     return num_layers_to_build
 
 
-def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_list, tf_config, vp_rank=None):
+def merge_router_topk_indices(
+    attention_mask,
+    input_ids,
+    mini_layer_topk_idx_list,
+    tf_config,
+    vp_rank=None,
+    use_sequence_packing=True,
+    sequence_parallel=False,
+):
     """
     Merge recorded router top-k indices across sequence-parallel ranks for all router instances,
     then pack/unpack them to align with the original (batch, seq_len) layout and append the result.
@@ -182,10 +190,14 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
             the current micro-batch.
         vp_rank (Optional[int]): Virtual pipeline stage rank override. If None, the current VP rank from
             Megatron parallel state will be used.
+        use_sequence_packing (bool): If True, use THD (packed sequences) format. If False, use BSHD format.
+            Defaults to True for backward compatibility.
+        sequence_parallel (bool): Whether sequence parallelism is enabled. Used for BSHD format.
+            Defaults to False.
 
     Returns:
         None: The function has side effects only; it appends a tensor of shape
-        [1, dynamic_bs_all, layer_num, topk] to mini_layer_topk_idx_list.
+        [bs, seq_len, layer_num, topk] to mini_layer_topk_idx_list.
     """
     with torch.no_grad():
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
@@ -203,10 +215,17 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
         )
 
         batch_size, seq_len = attention_mask.shape[:2]
-        _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
-        layers_topk_idx = postprocess_packed_seqs(
-            layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
-        )
+
+        if use_sequence_packing:
+            # THD format: use sequence packing/unpacking
+            _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
+            layers_topk_idx = postprocess_packed_seqs(
+                layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
+            )
+        else:
+            # BSHD format: use dedicated postprocess function
+            layers_topk_idx = _postprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel)
+
         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
 
 
@@ -292,6 +311,100 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
                 result[i, half_seq : half_seq + second_len] = orig_indices[second_start:second_end]
 
     return result.to(device_name)
+
+
+def _postprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel=False):
+    """
+    BSHD format router indices postprocessing. Inverse of _preprocess_router_indices_bshd.
+
+    Converts router indices from SP-gathered flattened format back to original layout.
+
+    Args:
+        layers_topk_idx: [1, seq_per_gpu * batch, layer_num, topk] - flattened format after SP gather
+        attention_mask: [bs, max_seq_len]
+        sequence_parallel: Whether sequence parallelism is enabled
+
+    Returns:
+        [bs, max_seq_len, layer_num, topk] - original layout with left-padding restored
+    """
+    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank()
+
+    batch_size, max_seq_len = attention_mask.shape
+    seq_lens = attention_mask.sum(dim=1)
+    seq_len = seq_lens.max().item()
+
+    # Alignment calculation (same logic as _preprocess_router_indices_bshd)
+    if cp_size > 1:
+        sp_world_size = mpu.get_tensor_model_parallel_world_size() if sequence_parallel else 1
+        alignment = cp_size * 2 * max(64, sp_world_size)
+    elif sequence_parallel:
+        sp_world_size = mpu.get_tensor_model_parallel_world_size()
+        alignment = sp_world_size
+    else:
+        alignment = 64
+
+    pad_size = (alignment - seq_len % alignment) % alignment
+    seq_len_padded = seq_len + pad_size
+
+    if cp_size > 1:
+        seq_per_gpu = seq_len_padded // cp_size
+    else:
+        seq_per_gpu = seq_len_padded
+
+    # Input shape: [1, seq_per_gpu * batch, layer_num, topk]
+    # Squeeze the leading dimension
+    layers_topk_idx = layers_topk_idx.squeeze(0)  # [seq_per_gpu * batch, layer_num, topk]
+
+    layer_num, topk = layers_topk_idx.shape[1], layers_topk_idx.shape[2]
+
+    # Reshape: [seq_per_gpu * batch, layer_num, topk] -> [seq_per_gpu, batch, layer_num, topk]
+    layers_topk_idx = layers_topk_idx.reshape(seq_per_gpu, batch_size, layer_num, topk)
+
+    # Transpose: [seq_per_gpu, batch, layer_num, topk] -> [batch, seq_per_gpu, layer_num, topk]
+    layers_topk_idx = layers_topk_idx.transpose(0, 1)
+
+    # Initialize output tensor with 255 (padding sentinel for uint8)
+    PADDING_EXPERT_IDX = 255
+    result = torch.full(
+        (batch_size, max_seq_len, layer_num, topk),
+        fill_value=PADDING_EXPERT_IDX,
+        dtype=layers_topk_idx.dtype,
+        device=layers_topk_idx.device,
+    )
+
+    for i in range(batch_size):
+        valid_len = seq_lens[i].item()
+        left_pad = max_seq_len - valid_len
+
+        if cp_size <= 1:
+            # Simple case: convert right-padded to left-padded
+            copy_len = min(valid_len, seq_per_gpu)
+            result[i, left_pad : left_pad + copy_len] = layers_topk_idx[i, :copy_len]
+        else:
+            # CP case: reassemble chunks (inverse of _preprocess_router_indices_bshd)
+            chunk_size = seq_len_padded // (cp_size * 2)
+            half_seq = seq_per_gpu // 2
+
+            # First chunk: was chunk[cp_rank] -> restore to original position
+            first_start = chunk_size * cp_rank
+            first_end = min(first_start + chunk_size, valid_len)
+            first_len = max(0, first_end - first_start)
+            if first_len > 0:
+                result[i, left_pad + first_start : left_pad + first_end] = layers_topk_idx[i, :first_len]
+
+            # Second chunk: was chunk[-(cp_rank+1)] -> restore to original position
+            second_start = seq_len_padded - chunk_size * (cp_rank + 1)
+            second_end = seq_len_padded - chunk_size * cp_rank
+            second_start_valid = max(0, min(second_start, valid_len))
+            second_end_valid = max(0, min(second_end, valid_len))
+            second_len = max(0, second_end_valid - second_start_valid)
+            if second_len > 0:
+                result[i, left_pad + second_start_valid : left_pad + second_end_valid] = layers_topk_idx[
+                    i, half_seq : half_seq + second_len
+                ]
+
+    return result
 
 
 def set_router_replay_data(

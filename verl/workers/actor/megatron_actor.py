@@ -739,7 +739,13 @@ class MegatronPPOActor(BasePPOActor):
 
             if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):
                 merge_router_topk_indices(
-                    attention_mask, input_ids, self.mini_layer_topk_idx_list, self.tf_config, vp_rank
+                    attention_mask,
+                    input_ids,
+                    self.mini_layer_topk_idx_list,
+                    self.tf_config,
+                    vp_rank,
+                    use_sequence_packing=self.use_sequence_packing,
+                    sequence_parallel=self.tf_config.sequence_parallel,
                 )
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
