@@ -247,13 +247,13 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
     else:
         seq_len_per_gpu = seq_len_padded
 
-    # Initialize output tensor
+    # Initialize output tensor with -1 (invalid expert index)
+    # This ensures padding tokens don't contribute to routing_map
+    # (zeros would cause padding tokens to route to expert 0)
     layer_num, topk = layers_topk_idx.shape[2], layers_topk_idx.shape[3]
-    result = torch.zeros(
-        batch_size,
-        seq_len_per_gpu,
-        layer_num,
-        topk,
+    result = torch.full(
+        (batch_size, seq_len_per_gpu, layer_num, topk),
+        fill_value=-1,
         dtype=layers_topk_idx.dtype,
         device=layers_topk_idx.device,
     )

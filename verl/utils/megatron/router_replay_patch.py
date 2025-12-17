@@ -179,7 +179,32 @@ def _patched_topk_routing_with_score_function(
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
 
-            # Gather the scores for the replayed indices to get the probabilities
+            # Handle padding tokens (marked with -1 indices from BSHD preprocessing)
+            # Padding tokens need valid indices for computation but don't affect real routing
+            valid_mask = (top_indices >= 0).all(dim=-1)  # [num_tokens]
+
+            if not valid_mask.all():
+                # Mixed case: some valid tokens, some padding tokens
+                # For padding tokens, use regular topk to get valid indices
+                padding_probs, padding_indices = _compute_topk(
+                    scores[~valid_mask], topk, num_groups=num_groups, group_topk=group_topk
+                )
+
+                # Prepare output tensors
+                probs = torch.empty_like(scores[:, :topk])
+                final_indices = torch.empty_like(top_indices)
+
+                # Fill valid tokens with replay data
+                probs[valid_mask] = scores[valid_mask].gather(1, top_indices[valid_mask])
+                final_indices[valid_mask] = top_indices[valid_mask]
+
+                # Fill padding tokens with computed topk
+                probs[~valid_mask] = padding_probs
+                final_indices[~valid_mask] = padding_indices
+
+                return probs, final_indices
+
+            # All valid case: use original logic
             probs = scores.gather(1, top_indices)
             return probs, top_indices
         elif routing_action == RouterReplayAction.REPLAY_BACKWARD:
@@ -191,7 +216,28 @@ def _patched_topk_routing_with_score_function(
             top_indices = router_replay.replay_backward_list.pop(0)
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
+
+            # Handle padding tokens (marked with -1 indices from BSHD preprocessing)
+            valid_mask = (top_indices >= 0).all(dim=-1)  # [num_tokens]
+
+            if not valid_mask.all():
+                # Mixed case: some valid tokens, some padding tokens
+                padding_probs, padding_indices = _compute_topk(
+                    scores[~valid_mask], topk, num_groups=num_groups, group_topk=group_topk
+                )
+
+                probs = torch.empty_like(scores[:, :topk])
+                final_indices = torch.empty_like(top_indices)
+
+                probs[valid_mask] = scores[valid_mask].gather(1, top_indices[valid_mask])
+                final_indices[valid_mask] = top_indices[valid_mask]
+
+                probs[~valid_mask] = padding_probs
+                final_indices[~valid_mask] = padding_indices
+
+                return probs, final_indices
+
+            # All valid case: use original logic
             probs = scores.gather(1, top_indices)
             return probs, top_indices
         else:  # Unknown action, fallback
