@@ -220,7 +220,8 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
         sequence_parallel: Whether sequence parallelism is enabled (used for alignment calculation)
 
     Returns:
-        [bs, seq_len_per_gpu, layer_num, topk] - CP split + alignment applied indices
+        result: [bs, seq_len_per_gpu, layer_num, topk] - CP split + alignment applied indices
+        valid_mask_2d: [bs, seq_len_per_gpu] - Boolean mask indicating valid (non-padding) positions
     """
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
@@ -247,16 +248,19 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
     else:
         seq_len_per_gpu = seq_len_padded
 
-    # Initialize output tensor with -1 (invalid expert index)
-    # This ensures padding tokens don't contribute to routing_map
-    # (zeros would cause padding tokens to route to expert 0)
+    # Initialize output tensors
     layer_num, topk = layers_topk_idx.shape[2], layers_topk_idx.shape[3]
-    result = torch.full(
-        (batch_size, seq_len_per_gpu, layer_num, topk),
-        fill_value=-1,
+    result = torch.zeros(
+        batch_size,
+        seq_len_per_gpu,
+        layer_num,
+        topk,
         dtype=layers_topk_idx.dtype,
         device=layers_topk_idx.device,
     )
+
+    # Valid mask to track non-padding positions (same pattern as preprocess_bshd's new_attention_mask_2d)
+    valid_mask_2d = torch.zeros(batch_size, seq_len_per_gpu, dtype=torch.bool, device=layers_topk_idx.device)
 
     for i in range(batch_size):
         valid_len = seq_lens[i].item()
@@ -268,6 +272,7 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
             # Simple right-padding conversion
             copy_len = min(valid_len, seq_len_per_gpu)
             result[i, :copy_len] = orig_indices[:copy_len]
+            valid_mask_2d[i, :copy_len] = True
         else:
             # CP chunk splitting (same pattern as preprocess_bshd)
             chunk_size = seq_len_padded // (cp_size * 2)
@@ -279,6 +284,7 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
             first_len = max(0, first_end - first_start)
             if first_len > 0:
                 result[i, :first_len] = orig_indices[first_start:first_end]
+                valid_mask_2d[i, :first_len] = True
 
             # Second chunk: chunk[-(cp_rank+1)]
             second_start = seq_len_padded - chunk_size * (cp_rank + 1)
@@ -288,8 +294,9 @@ def _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_pa
             second_len = max(0, second_end - second_start)
             if second_len > 0:
                 result[i, half_seq : half_seq + second_len] = orig_indices[second_start:second_end]
+                valid_mask_2d[i, half_seq : half_seq + second_len] = True
 
-    return result.to(device_name)
+    return result.to(device_name), valid_mask_2d.to(device_name)
 
 
 def set_router_replay_data(
@@ -328,25 +335,40 @@ def set_router_replay_data(
                 layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
             ).unsqueeze(dim=0)
         else:
-            # BSHD logic (new)
-            layers_topk_idx_split = _preprocess_router_indices_bshd(layers_topk_idx, attention_mask, sequence_parallel)
+            # BSHD logic: extract only valid tokens (no padding) similar to THD
+            layers_topk_idx_split, valid_mask_2d = _preprocess_router_indices_bshd(
+                layers_topk_idx, attention_mask, sequence_parallel
+            )
 
             # BSHD: [batch, seq_per_gpu, layer_num, topk]
             # Router receives [seq, batch, hidden] and does view(-1, num_experts)
             # So we need to flatten in the same order: transpose then flatten
             # [batch, seq_per_gpu, layer_num, topk] -> [seq_per_gpu, batch, layer_num, topk]
             layers_topk_idx_transposed = layers_topk_idx_split.transpose(0, 1)
+            # [batch, seq_per_gpu] -> [seq_per_gpu, batch]
+            valid_mask_transposed = valid_mask_2d.transpose(0, 1)
 
             # Apply SP scatter (if SP is enabled)
             if sequence_parallel:
                 # [seq_per_gpu, batch, layer_num, topk] -> [seq_per_gpu // sp, batch, layer_num, topk]
                 layers_topk_idx_transposed = scatter_to_sequence_parallel_region(layers_topk_idx_transposed)
+                # [seq_per_gpu, batch] -> [seq_per_gpu // sp, batch]
+                # Need to add dummy dim for scatter, then remove it
+                valid_mask_transposed = scatter_to_sequence_parallel_region(
+                    valid_mask_transposed.unsqueeze(-1).to(layers_topk_idx_transposed.dtype)
+                ).squeeze(-1).bool()
 
-            # Flatten: [seq_per_gpu // sp * batch, layer_num, topk]
-            seq_per_gpu_sp, batch_size = layers_topk_idx_transposed.shape[:2]
-            layers_topk_idx_rmpad_split = layers_topk_idx_transposed.reshape(
-                1, seq_per_gpu_sp * batch_size, -1, layers_topk_idx_split.shape[-1]
-            )
+            # Extract only valid tokens (like THD does via packing)
+            seq_per_gpu_sp, batch_size_local = layers_topk_idx_transposed.shape[:2]
+            layer_num, topk = layers_topk_idx_transposed.shape[2], layers_topk_idx_transposed.shape[3]
+
+            # Flatten: [seq_per_gpu_sp * batch, layer_num, topk]
+            flat_indices = layers_topk_idx_transposed.reshape(seq_per_gpu_sp * batch_size_local, layer_num, topk)
+            flat_mask = valid_mask_transposed.reshape(seq_per_gpu_sp * batch_size_local)
+
+            # Select only valid tokens (removing padding)
+            valid_indices = flat_indices[flat_mask]  # [num_valid_tokens, layer_num, topk]
+            layers_topk_idx_rmpad_split = valid_indices.unsqueeze(0)  # [1, num_valid_tokens, layer_num, topk]
 
         # Common: set indices for each router
         # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
