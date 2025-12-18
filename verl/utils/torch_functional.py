@@ -834,6 +834,9 @@ def safe_exp(x: torch.Tensor) -> torch.Tensor:
     in range exp(-87) ~ exp(88). This function computes exp() in FP32 to avoid
     overflow/underflow issues in FP16/BF16 training.
 
+    For FP16/BF16 inputs, the input is clamped to max=11.0 to prevent overflow
+    when converting the result back to the original dtype (FP16 max = 65504).
+
     Args:
         x: Input tensor of any dtype
 
@@ -841,5 +844,11 @@ def safe_exp(x: torch.Tensor) -> torch.Tensor:
         Tensor with exp(x) computed in FP32, converted back to original dtype
     """
     original_dtype = x.dtype
+
+    # Clamp input for FP16/BF16 to prevent overflow after dtype conversion
+    # FP16 max = 65504, log(65504) ≈ 11.09
+    if original_dtype in (torch.float16, torch.bfloat16):
+        x = torch.clamp(x, max=11.0)
+
     result = torch.exp(x.float())
     return result.to(original_dtype)

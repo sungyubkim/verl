@@ -797,16 +797,18 @@ def compute_offpolicy_metrics(
         # where ρ = π_training / π_rollout and μ = π_rollout (rollout distribution)
         # This measures the variance of importance sampling weights
         # Token-level: E_token[ρ²] - 1 (averaged over all tokens)
-        log_ratio_safe = torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-        rho_token = torch.exp(log_ratio_safe)  # ρ = π_training / π_rollout (token-level)
+        # Use tighter bound for chi2 since we square the result: exp(5.5)² ≈ 60000 < FP16 max
+        CHI2_SAFETY_BOUND = 5.5
+        log_ratio_chi2 = torch.clamp(log_ratio, min=-CHI2_SAFETY_BOUND, max=CHI2_SAFETY_BOUND)
+        rho_token = torch.exp(log_ratio_chi2)  # ρ = π_training / π_rollout (token-level)
         rho_squared_token = rho_token.square()
         chi2_token = verl_F.masked_mean(rho_squared_token, response_mask) - 1.0
         metrics["chi2_token"] = chi2_token.detach().item()
 
         # Sequence-level: E_seq[(Π ρ_t)²] - 1 = E_seq[exp(2 * Σ log ρ_t)] - 1
         log_ratio_sum = verl_F.masked_sum(log_ratio, response_mask, axis=-1)  # Σ log ρ_t per sequence
-        log_ratio_sum_safe = torch.clamp(log_ratio_sum, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-        rho_squared_seq = torch.exp(2.0 * log_ratio_sum_safe)  # (Π ρ_t)²
+        log_ratio_sum_chi2 = torch.clamp(log_ratio_sum, min=-CHI2_SAFETY_BOUND, max=CHI2_SAFETY_BOUND)
+        rho_squared_seq = torch.exp(2.0 * log_ratio_sum_chi2)  # (Π ρ_t)²
         chi2_seq = rho_squared_seq.mean() - 1.0
         metrics["chi2_seq"] = chi2_seq.detach().item()
 
