@@ -113,6 +113,10 @@ class _VocabParallelEntropy(torch.autograd.Function):
         def mul_reduce(a, b):
             return (a * b).sum(dim=-1, keepdim=True)
 
+        # Convert to FP32 for numerical stability (FP16 exp() has narrow safe range)
+        original_dtype = vocab_parallel_logits.dtype
+        vocab_parallel_logits = vocab_parallel_logits.float()
+
         logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
         dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=mpu.get_tensor_model_parallel_group())
         normalized_vocab_parallel_logits = vocab_parallel_logits - logits_max
@@ -123,12 +127,19 @@ class _VocabParallelEntropy(torch.autograd.Function):
         sum_softmax_times_logits = mul_reduce(softmax_logits, vocab_parallel_logits)
         dist.all_reduce(sum_softmax_times_logits, group=mpu.get_tensor_model_parallel_group())
         entropy = logits_max + normalized_sum_exp_logits.log() - sum_softmax_times_logits
+
         ctx.save_for_backward(vocab_parallel_logits, softmax_logits, sum_softmax_times_logits)
-        return entropy.squeeze(dim=-1)
+        ctx.original_dtype = original_dtype
+
+        return entropy.to(original_dtype).squeeze(dim=-1)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
         vocab_parallel_logits, softmax_logits, sum_softmax_times_logits = ctx.saved_tensors
+
+        # Compute gradient in FP32 (saved tensors are already FP32)
+        grad_output = grad_output.float()
+
         # reuse softmax_logits as grad
         vocab_parallel_logits.sub_(sum_softmax_times_logits)
         softmax_logits.mul_(vocab_parallel_logits)
@@ -136,7 +147,9 @@ class _VocabParallelEntropy(torch.autograd.Function):
         # recover vocab_parallel_logits
         vocab_parallel_logits.add_(sum_softmax_times_logits)
         softmax_logits.mul_(-1)
-        return softmax_logits
+
+        # Convert gradient back to original dtype
+        return softmax_logits.to(ctx.original_dtype)
 
 
 def vocab_parallel_entropy(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:

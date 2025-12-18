@@ -825,3 +825,21 @@ def use_original_torch_compile():
             yield
     except Exception:
         yield
+
+
+def safe_exp(x: torch.Tensor) -> torch.Tensor:
+    """Numerically stable exp() - compute in FP32 and restore original dtype.
+
+    FP16 exp() is only safe in range exp(-11) ~ exp(11), while FP32 is safe
+    in range exp(-87) ~ exp(88). This function computes exp() in FP32 to avoid
+    overflow/underflow issues in FP16/BF16 training.
+
+    Args:
+        x: Input tensor of any dtype
+
+    Returns:
+        Tensor with exp(x) computed in FP32, converted back to original dtype
+    """
+    original_dtype = x.dtype
+    result = torch.exp(x.float())
+    return result.to(original_dtype)

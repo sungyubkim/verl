@@ -14,6 +14,7 @@
 
 import torch
 from megatron.core.fusions.fused_cross_entropy import calculate_logits_max
+from verl.utils.torch_functional import safe_exp
 from megatron.core.parallel_state import (
     get_data_parallel_rank,
     get_tensor_model_parallel_group,
@@ -24,7 +25,8 @@ from megatron.core.tensor_parallel.utils import VocabUtility
 
 
 def normalize(logps):
-    probs = torch.exp(logps)
+    # Use safe_exp for FP16 stability
+    probs = safe_exp(logps)
     probs = probs / probs.sum(dim=-1, keepdim=True)
     normalized_logps = torch.log(probs)
     return normalized_logps
@@ -71,7 +73,7 @@ class _VocabParallelKLDivergence(torch.autograd.Function):
 
         vocab_parallel_target_topk_indices = target_topk_indices - vocab_start_index
         vocab_parallel_target_topk_indices[~topk_indices_in_vocab_mask] = 0
-        vocab_parallel_target_topk_probs = torch.exp(target_topk_logps)
+        vocab_parallel_target_topk_probs = safe_exp(target_topk_logps)
         vocab_parallel_target_topk_probs[~topk_indices_in_vocab_mask] = 0
         vocab_parallel_target_topk_logps = torch.empty_like(target_topk_logps)
         vocab_parallel_target_topk_logps[...] = target_topk_logps[...]

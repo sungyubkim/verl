@@ -16,6 +16,7 @@ import logging
 import torch
 
 from verl.protocol import DataProto
+from verl.utils.torch_functional import safe_exp
 
 logger = logging.getLogger(__file__)
 
@@ -95,8 +96,8 @@ def calculate_debug_metrics(data: DataProto) -> dict:
 
     response_mask = log_prob_mask[:, -response_length:]
     # calculate pearson corrcoef
-    actor_probs = torch.exp(actor_old_log_probs)
-    rollout_probs = torch.exp(rollout_old_log_probs)
+    actor_probs = safe_exp(actor_old_log_probs)
+    rollout_probs = safe_exp(rollout_old_log_probs)
     response_mask_bool = response_mask.bool()
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)

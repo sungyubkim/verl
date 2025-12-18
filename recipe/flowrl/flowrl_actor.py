@@ -454,8 +454,9 @@ class FlowRLActor(DataParallelPPOActor):
         delta = log_z + avg_log_prob - self.flowrl_beta_coef * seq_log_reward - avg_ref_log_prob
 
         # Importance ratio from current vs old policy (product of token ratios)
+        # Use safe_exp for FP16 stability
         log_w = verl_F.masked_sum(log_prob - old_log_prob, response_mask, axis=1)
-        imp_w_raw = torch.exp(log_w).detach()
+        imp_w_raw = verl_F.safe_exp(log_w).detach()
         imp_w = torch.clamp(imp_w_raw, max=10)
 
         # Loss: weighted squared residual with importance weights

@@ -1044,8 +1044,8 @@ def compute_policy_loss_gspo(
     log_seq_importance_ratio = log_prob - log_prob.detach() + negative_approx_kl_seq.detach().unsqueeze(-1)
     log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)  # clamp for numerical stability
 
-    # finaly exp() to remove log
-    seq_importance_ratio = torch.exp(log_seq_importance_ratio)
+    # finaly exp() to remove log (use safe_exp for FP16 stability)
+    seq_importance_ratio = verl_F.safe_exp(log_seq_importance_ratio)
 
     pg_losses1 = -advantages * seq_importance_ratio
     pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
@@ -1348,9 +1348,10 @@ def compute_policy_loss_geo_mean(
     negative_approx_kl_min = torch.min(sgn_advantage * negative_approx_kl, sgn_advantage * negative_approx_kl_clamp)
     negative_approx_kl_min = sgn_advantage * negative_approx_kl_min
 
-    # Geometric-Mean Policy Optimization
+    # Geometric-Mean Policy Optimization (use safe_exp for FP16 stability)
     response_mask_sum = response_mask.sum(dim=-1)
-    ratio = torch.exp((negative_approx_kl_min * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8))
+    log_ratio = (negative_approx_kl_min * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
+    ratio = verl_F.safe_exp(log_ratio)
     # we only support sequence level advantage for now,
     # otherwise, below would be not consistent with the paper
     advantage = (advantages * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
@@ -1361,9 +1362,9 @@ def compute_policy_loss_geo_mean(
     if rollout_is_weights is not None:
         # Aggregate token-level weights to sequence level using geometric mean for consistency
         # Note: rollout_is_weights is always 2D regardless of aggregation mode
-        seq_is_weights = torch.exp(
-            (torch.log(rollout_is_weights + 1e-10) * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
-        )
+        # Use safe_exp for FP16 stability
+        log_seq_is = (torch.log(rollout_is_weights + 1e-10) * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
+        seq_is_weights = verl_F.safe_exp(log_seq_is)
         pg_losses = pg_losses * seq_is_weights
 
     pg_loss = torch.mean(pg_losses)
