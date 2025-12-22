@@ -391,9 +391,50 @@ def hf_to_mcore_config_llama4(
     raise NotImplementedError("Llama4ForConditionalGeneration is not supported yet")
 
 
+def mapping_string_to_dtype(value: str) -> torch.dtype:
+    """Convert string representation of dtype to torch.dtype.
+
+    Supports formats like:
+    - "fp16", "float16", "torch.float16"
+    - "bf16", "bfloat16", "torch.bfloat16"
+    - "fp32", "float32", "torch.float32"
+    """
+    # Normalize the string
+    dtype_str = value.lower().replace("torch.", "")
+
+    dtype_mapping = {
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "float": torch.float32,
+    }
+
+    if dtype_str in dtype_mapping:
+        return dtype_mapping[dtype_str]
+    else:
+        raise ValueError(f"Unsupported dtype string: {value}. Supported: {list(dtype_mapping.keys())}")
+
+
 def mapping_string_to_attn_backend(args: dict) -> dict:
+    """Convert string values in config dict to proper types.
+
+    Handles:
+    - attention_backend: str -> AttnBackend enum
+    - dtype fields (autocast_dtype, params_dtype, pipeline_dtype): str -> torch.dtype
+    """
     if "attention_backend" in args and isinstance(args["attention_backend"], str):
         from megatron.core.transformer.enums import AttnBackend
 
         args["attention_backend"] = AttnBackend[args["attention_backend"]]
+
+    # Convert dtype string fields to torch.dtype
+    dtype_fields = ["autocast_dtype", "params_dtype", "pipeline_dtype"]
+    for field in dtype_fields:
+        if field in args and isinstance(args[field], str):
+            args[field] = mapping_string_to_dtype(args[field])
+
     return args
