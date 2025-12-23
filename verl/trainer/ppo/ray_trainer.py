@@ -1285,6 +1285,27 @@ class RayPPOTrainer:
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
+                                # Sanitize rollout_log_probs: NaN 토큰을 response_mask에서 제외
+                                rollout_log_probs = batch.batch["rollout_log_probs"]
+                                nan_mask = torch.isnan(rollout_log_probs)
+
+                                if nan_mask.any():
+                                    nan_count = nan_mask.sum().item()
+                                    logger.warning(
+                                        f"[NaN SANITIZE] rollout_log_probs has {nan_count} NaN values, masking out"
+                                    )
+
+                                    # NaN → 0으로 대체 (safe_exp(0)=1, 중립값)
+                                    rollout_log_probs = rollout_log_probs.clone()
+                                    rollout_log_probs[nan_mask] = 0.0
+                                    batch.batch["rollout_log_probs"] = rollout_log_probs
+
+                                    # response_mask에서 해당 토큰 제외
+                                    if "response_mask" in batch.batch:
+                                        response_mask = batch.batch["response_mask"].clone()
+                                        response_mask[nan_mask] = 0.0
+                                        batch.batch["response_mask"] = response_mask
+
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
