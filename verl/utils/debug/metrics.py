@@ -21,6 +21,29 @@ from verl.utils.torch_functional import safe_exp
 logger = logging.getLogger(__file__)
 
 
+def _check_tensor_issues(name: str, tensor: torch.Tensor) -> None:
+    """NaN/Inf 발생 시에만 warning 로그 출력 (dtype, shape, 유효값 범위 포함)"""
+    has_nan = torch.isnan(tensor).any().item()
+    has_inf = torch.isinf(tensor).any().item()
+
+    if has_nan or has_inf:
+        nan_count = torch.isnan(tensor).sum().item()
+        inf_count = torch.isinf(tensor).sum().item()
+
+        # 유효값 범위 계산
+        valid_mask = ~(torch.isnan(tensor) | torch.isinf(tensor))
+        if valid_mask.any():
+            valid_vals = tensor[valid_mask]
+            range_str = f"valid_range=[{valid_vals.min().item():.4f}, {valid_vals.max().item():.4f}]"
+        else:
+            range_str = "no valid values"
+
+        logger.warning(
+            f"[NaN DEBUG] {name}: dtype={tensor.dtype}, shape={list(tensor.shape)}, "
+            f"nan_count={nan_count}, inf_count={inf_count}, {range_str}"
+        )
+
+
 def calculate_token_list_diff(tensor1: torch.Tensor, tensor2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     # verify inputs
     if tensor1.numel() == 0 or tensor2.numel() == 0:
@@ -83,6 +106,11 @@ def calculate_debug_metrics(data: DataProto) -> dict:
 
     rollout_old_log_probs = data.batch["rollout_log_probs"]
     actor_old_log_probs = data.batch["old_log_probs"]
+
+    # 디버깅: NaN/Inf/dtype 문제 체크 (문제 시에만 로그 출력)
+    _check_tensor_issues("rollout_log_probs", rollout_old_log_probs)
+    _check_tensor_issues("old_log_probs", actor_old_log_probs)
+
     if "response_mask" in data.batch:
         logger.debug("response mask found, use it to mask log probs")
         log_prob_mask = data.batch["response_mask"]
