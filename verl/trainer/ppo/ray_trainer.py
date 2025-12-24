@@ -1284,6 +1284,28 @@ class RayPPOTrainer:
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
+
+                            # Sanitize old_log_probs: NaN 토큰을 response_mask에서 제외
+                            old_log_probs = batch.batch["old_log_probs"]
+                            nan_mask_old = torch.isnan(old_log_probs)
+
+                            if nan_mask_old.any():
+                                nan_count = nan_mask_old.sum().item()
+                                print(
+                                    f"[NaN SANITIZE] old_log_probs has {nan_count} NaN values, masking out"
+                                )
+
+                                # NaN → 0으로 대체 (safe_exp(0)=1, 중립값)
+                                old_log_probs = old_log_probs.clone()
+                                old_log_probs[nan_mask_old] = 0.0
+                                batch.batch["old_log_probs"] = old_log_probs
+
+                                # response_mask에서 해당 토큰 제외
+                                if "response_mask" in batch.batch:
+                                    response_mask = batch.batch["response_mask"].clone()
+                                    response_mask[nan_mask_old] = 0.0
+                                    batch.batch["response_mask"] = response_mask
+
                             if "rollout_log_probs" in batch.batch.keys():
                                 # Sanitize rollout_log_probs: NaN 토큰을 response_mask에서 제외
                                 rollout_log_probs = batch.batch["rollout_log_probs"]
@@ -1291,7 +1313,7 @@ class RayPPOTrainer:
 
                                 if nan_mask.any():
                                     nan_count = nan_mask.sum().item()
-                                    logger.warning(
+                                    print(
                                         f"[NaN SANITIZE] rollout_log_probs has {nan_count} NaN values, masking out"
                                     )
 
