@@ -22,6 +22,94 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
+from .model_forward import gptmodel_forward_no_padding, model_forward_gen
+from .model_forward_fused import fused_forward_model_gen
+
+
+class SupportedVLM(Enum):
+    QWEN2_5_VL = "Qwen2_5_VLForConditionalGeneration"
+    QWEN3_MOE_VL = "Qwen3VLMoeForConditionalGeneration"
+    QWEN3_VL = "Qwen3VLForConditionalGeneration"
+
+
+supported_vlm = [member.value for member in SupportedVLM]
+
+
+def get_mcore_forward_fn(hf_config, use_sequence_packing: bool = True) -> Callable:
+    """
+    Get the forward function for given model architecture.
+
+    Args:
+        hf_config: HuggingFace model configuration.
+        use_sequence_packing: Whether to use sequence packing (THD format).
+            If True (default), uses packed sequences (data_format="thd").
+            If False, uses standard BSHD format (data_format="bshd").
+
+    Returns:
+        A forward function that accepts data_format or uses the specified default.
+    """
+    assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
+    vision_model = hf_config.architectures[0] in supported_vlm
+    base_fn = model_forward_gen(vision_model)
+
+    # Convert use_sequence_packing to data_format
+    default_data_format = "thd" if use_sequence_packing else "bshd"
+
+    # Create wrapper that sets default data_format while preserving the ability to override
+    def wrapped_forward(*args, data_format: str = None, **kwargs):
+        if data_format is None:
+            data_format = default_data_format
+        return base_fn(*args, data_format=data_format, **kwargs)
+
+    return wrapped_forward
+
+
+def get_mcore_forward_no_padding_fn(hf_config, use_sequence_packing: bool = True) -> Callable:
+    """
+    Get the forward function for given model architecture with nested tensor inputs.
+
+    Args:
+        hf_config: HuggingFace model configuration.
+        use_sequence_packing: Whether to use sequence packing (THD format).
+            If True (default), uses packed sequences (data_format="thd").
+            If False, uses standard BSHD format (data_format="bshd").
+
+    Returns:
+        A forward function that accepts data_format or uses the specified default.
+    """
+    assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
+    base_fn = gptmodel_forward_no_padding
+
+    # Convert use_sequence_packing to data_format
+    default_data_format = "thd" if use_sequence_packing else "bshd"
+
+    # Create wrapper that sets default data_format while preserving the ability to override
+    def wrapped_forward(*args, data_format: str = None, **kwargs):
+        if data_format is None:
+            data_format = default_data_format
+        return base_fn(*args, data_format=data_format, **kwargs)
+
+    return wrapped_forward
+
+
+def get_mcore_forward_fused_fn(hf_config) -> Callable:
+    """
+    Get the forward function for given model architecture.
+    """
+    assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
+    if hf_config.architectures[0] in supported_vlm:
+        return fused_forward_model_gen(True)
+    else:
+        # default to language model
+        return fused_forward_model_gen(False)
+
+
+# ruff: noqa
+
+########################################################
+# below is the deprecated code
+########################################################
+
 from .config_converter import (
     PretrainedConfig,
     TransformerConfig,
@@ -33,8 +121,6 @@ from .config_converter import (
     hf_to_mcore_config_qwen2moe,
     hf_to_mcore_config_qwen3moe,
 )
-from .model_forward import gptmodel_forward_no_padding, model_forward_gen
-from .model_forward_fused import fused_forward_model_gen
 from .model_initializer import (
     BaseModelInitializer,
     DeepseekV3Model,
@@ -68,9 +154,9 @@ class SupportedModel(Enum):
     GPT_OSS = "GptOssForCausalLM"  # GPT OSS via megatron.bridge
 
     QWEN3_TOKEN_CLASSIFICATION = "Qwen3ForTokenClassification"
+    LLAMA_TOKEN_CLASSIFICATION = "LlamaForTokenClassification"
     QWEN3_MOE_VL = "Qwen3VLMoeForConditionalGeneration"
     QWEN3_VL = "Qwen3VLForConditionalGeneration"
-    GPT_OSS = "GptOssForCausalLM"
 
 
 # Registry for model configuration converters
@@ -85,6 +171,7 @@ MODEL_CONFIG_CONVERTER_REGISTRY: dict[SupportedModel, Callable[[PretrainedConfig
     SupportedModel.QWEN3: hf_to_mcore_config_dense,
     SupportedModel.QWEN3_MOE: hf_to_mcore_config_qwen3moe,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: hf_to_mcore_config_dense,
+    SupportedModel.LLAMA_TOKEN_CLASSIFICATION: hf_to_mcore_config_dense,
 }
 
 # Registry for model initializers
@@ -99,6 +186,7 @@ MODEL_INITIALIZER_REGISTRY: dict[SupportedModel, type[BaseModelInitializer]] = {
     SupportedModel.QWEN3: DenseModel,
     SupportedModel.QWEN3_MOE: Qwen3MoEModel,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: DenseModel,
+    SupportedModel.LLAMA_TOKEN_CLASSIFICATION: DenseModel,
 }
 
 # Registry for model forward functions
@@ -114,9 +202,9 @@ MODEL_FORWARD_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.QWEN2_5_VL: model_forward_gen(True),
     SupportedModel.QWEN3_MOE_VL: model_forward_gen(True),
     SupportedModel.QWEN3_VL: model_forward_gen(True),
-    SupportedModel.DEEPSEEK_V3: model_forward_gen(),
     SupportedModel.GLM4_MOE: model_forward_gen(),
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: model_forward_gen(),
+    SupportedModel.LLAMA_TOKEN_CLASSIFICATION: model_forward_gen(),
     SupportedModel.GPT_OSS: model_forward_gen(),
 }
 
@@ -133,9 +221,9 @@ MODEL_FORWARD_NOPAD_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.LLAMA4: gptmodel_forward_no_padding,
     SupportedModel.QWEN3: gptmodel_forward_no_padding,
     SupportedModel.QWEN3_MOE: gptmodel_forward_no_padding,
-    SupportedModel.DEEPSEEK_V3: gptmodel_forward_no_padding,
     SupportedModel.GLM4_MOE: gptmodel_forward_no_padding,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: gptmodel_forward_no_padding,
+    SupportedModel.LLAMA_TOKEN_CLASSIFICATION: gptmodel_forward_no_padding,
     SupportedModel.GPT_OSS: gptmodel_forward_no_padding,
 }
 
@@ -145,7 +233,6 @@ MODEL_FORWARD_FUSED_REGISTRY: dict[SupportedModel, Callable] = {
     SupportedModel.QWEN2: fused_forward_model_gen(),
     SupportedModel.QWEN2_MOE: fused_forward_model_gen(),
     SupportedModel.MIXTRAL: fused_forward_model_gen(),
-    SupportedModel.DEEPSEEK_V3: fused_forward_model_gen(),
     SupportedModel.QWEN2_5_VL: fused_forward_model_gen(True),
     SupportedModel.QWEN3_MOE_VL: fused_forward_model_gen(True),
     SupportedModel.QWEN3_VL: fused_forward_model_gen(True),
@@ -168,6 +255,7 @@ MODEL_WEIGHT_CONVERTER_REGISTRY: dict[SupportedModel, type] = {
     SupportedModel.QWEN3_MOE: McoreToHFWeightConverterQwen3Moe,
     SupportedModel.QWEN2_5_VL: McoreToHFWeightConverterQwen2_5_VL,
     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: McoreToHFWeightConverterDense,
+    SupportedModel.LLAMA_TOKEN_CLASSIFICATION: McoreToHFWeightConverterDense,
 }
 
 
@@ -235,79 +323,6 @@ def init_mcore_model(
         value=value,
         **extra_kwargs,
     )
-
-
-def get_mcore_forward_fn(hf_config: PretrainedConfig, use_sequence_packing: bool = True) -> Callable:
-    """
-    Get the forward function for given model architecture.
-
-    Args:
-        hf_config: HuggingFace model configuration.
-        use_sequence_packing: Whether to use sequence packing (THD format).
-            If True (default), uses packed sequences (data_format="thd").
-            If False, uses standard BSHD format (data_format="bshd").
-
-    Returns:
-        A forward function that accepts data_format or uses the specified default.
-    """
-    assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    model = get_supported_model(hf_config.architectures[0])
-
-    # Determine if this is a vision model
-    vision_models = {SupportedModel.QWEN2_5_VL, SupportedModel.QWEN3_MOE_VL, SupportedModel.QWEN3_VL}
-    is_vision_model = model in vision_models
-
-    # Generate base forward function
-    base_forward_fn = model_forward_gen(vision_model=is_vision_model)
-
-    # Convert use_sequence_packing to data_format
-    default_data_format = "thd" if use_sequence_packing else "bshd"
-
-    # Create wrapper that sets default data_format while preserving the ability to override
-    def wrapped_forward(*args, data_format: str = None, **kwargs):
-        if data_format is None:
-            data_format = default_data_format
-        return base_forward_fn(*args, data_format=data_format, **kwargs)
-
-    return wrapped_forward
-
-
-def get_mcore_forward_no_padding_fn(hf_config: PretrainedConfig, use_sequence_packing: bool = True) -> Callable:
-    """
-    Get the forward function for given model architecture with nested tensor inputs.
-
-    Args:
-        hf_config: HuggingFace model configuration.
-        use_sequence_packing: Whether to use sequence packing (THD format).
-            If True (default), uses packed sequences (data_format="thd").
-            If False, uses standard BSHD format (data_format="bshd").
-
-    Returns:
-        A forward function that accepts data_format or uses the specified default.
-    """
-    assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    model = get_supported_model(hf_config.architectures[0])
-    base_forward_fn = MODEL_FORWARD_NOPAD_REGISTRY[model]
-
-    # Convert use_sequence_packing to data_format
-    default_data_format = "thd" if use_sequence_packing else "bshd"
-
-    # Create wrapper that sets default data_format while preserving the ability to override
-    def wrapped_forward(*args, data_format: str = None, **kwargs):
-        if data_format is None:
-            data_format = default_data_format
-        return base_forward_fn(*args, data_format=data_format, **kwargs)
-
-    return wrapped_forward
-
-
-def get_mcore_forward_fused_fn(hf_config: PretrainedConfig) -> Callable:
-    """
-    Get the forward function for given model architecture.
-    """
-    assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    model = get_supported_model(hf_config.architectures[0])
-    return MODEL_FORWARD_FUSED_REGISTRY[model]
 
 
 def get_mcore_weight_converter(hf_config: PretrainedConfig, dtype: torch.dtype) -> Callable:
