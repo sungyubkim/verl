@@ -269,7 +269,10 @@ class RLHFDataset(Dataset):
         if isinstance(target_features, dict):
             # Target is a struct
             if not isinstance(data, dict):
-                data = {}
+                # Data type mismatch - target expects struct but data is not dict
+                # This can happen if data is a primitive type (string, int, etc.)
+                # Return default struct instead of corrupting the data
+                return self._get_default_for_feature(target_features)
 
             result = dict(data)
             for key, feat in target_features.items():
