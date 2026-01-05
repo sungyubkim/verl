@@ -324,38 +324,41 @@ class RLHFDataset(Dataset):
         local_logger = logging.getLogger(__name__)
 
         current_features = dataframe.features
-        needs_filling = False
 
-        # Check if any nested struct filling is needed
+        # Track which columns actually need filling (not all dict-like features!)
+        cols_to_fill = set()
+
         for col, feat in unified_features.items():
+            if col.startswith('_'):
+                # Skip internal columns like _file_index, _source_file
+                continue
             if col not in current_features:
-                needs_filling = True
-                break
-            if isinstance(feat, dict):
+                # Column missing entirely
+                cols_to_fill.add(col)
+            elif isinstance(feat, dict):
                 # Check nested struct differences
                 current_feat = current_features.get(col)
                 if current_feat != feat:
-                    needs_filling = True
-                    break
+                    cols_to_fill.add(col)
             elif hasattr(feat, 'feature') and isinstance(feat.feature, dict):
                 current_feat = current_features.get(col)
                 if hasattr(current_feat, 'feature') and current_feat.feature != feat.feature:
-                    needs_filling = True
-                    break
+                    cols_to_fill.add(col)
 
-        if needs_filling:
-            # Use closure to capture unified_features and self
+        if cols_to_fill:
+            local_logger.info(f"Columns needing schema filling: {cols_to_fill}")
+
+            # Use closure to capture variables
             fill_nested = self._fill_nested_fields
             get_default = self._get_default_for_feature
 
             def normalize_example(example):
-                for col, feat in unified_features.items():
-                    if col.startswith('_'):
-                        # Skip internal columns like _file_index, _source_file
-                        continue
+                # Only process columns that actually need filling
+                for col in cols_to_fill:
+                    feat = unified_features[col]
                     if col not in example or example[col] is None:
                         example[col] = get_default(feat)
-                    elif isinstance(feat, dict) or (hasattr(feat, 'feature') and isinstance(feat.feature, dict)):
+                    else:
                         example[col] = fill_nested(example[col], feat)
                 return example
 
