@@ -189,7 +189,7 @@ class RLHFDataset(Dataset):
             # Default to None for unknown types
             return None
 
-    def _merge_features_recursive(self, f1: dict, f2: dict) -> dict:
+    def _merge_features_recursive(self, f1: dict, f2: dict, exclude_cols: set = None) -> dict:
         """
         Recursively merge two feature dicts to create a union schema.
 
@@ -201,13 +201,18 @@ class RLHFDataset(Dataset):
         Args:
             f1: First feature dict
             f2: Second feature dict (to merge into f1)
+            exclude_cols: Set of column names to exclude from merging (keep f1's version)
 
         Returns:
             Merged feature dict containing all fields from both
         """
         result = dict(f1)
+        exclude_cols = exclude_cols or set()
 
         for key, feat2 in f2.items():
+            # Skip excluded columns - keep f1's feature as-is
+            if key in exclude_cols:
+                continue
             if key not in result:
                 # New field - add it
                 result[key] = feat2
@@ -306,7 +311,8 @@ class RLHFDataset(Dataset):
     def _normalize_to_unified_schema(
         self,
         dataframe: datasets.Dataset,
-        unified_features: datasets.Features
+        unified_features: datasets.Features,
+        exclude_cols: set = None
     ) -> datasets.Dataset:
         """
         Normalize dataset to match unified schema.
@@ -316,6 +322,7 @@ class RLHFDataset(Dataset):
         Args:
             dataframe: Dataset to normalize
             unified_features: Unified schema (union of all datasets)
+            exclude_cols: Set of column names to exclude from normalization
 
         Returns:
             Normalized dataset with schema matching unified_features
@@ -324,13 +331,14 @@ class RLHFDataset(Dataset):
         local_logger = logging.getLogger(__name__)
 
         current_features = dataframe.features
+        exclude_cols = exclude_cols or set()
 
         # Track which columns actually need filling (not all dict-like features!)
         cols_to_fill = set()
 
         for col, feat in unified_features.items():
-            if col.startswith('_'):
-                # Skip internal columns like _file_index, _source_file
+            if col.startswith('_') or col in exclude_cols:
+                # Skip internal columns and excluded columns (like prompt_key)
                 continue
             if col not in current_features:
                 # Column missing entirely
@@ -482,11 +490,17 @@ class RLHFDataset(Dataset):
         if normalize and len(self.data_files) > 1:
             logger.info("Schema normalization enabled. Computing union schema from all datasets...")
 
+            # Exclude prompt_key from normalization to preserve its data structure
+            # (chat messages can have different feature representations that shouldn't be merged)
+            prompt_key = self.config.get('prompt_key', 'prompt')
+            exclude_cols = {prompt_key}
+            logger.info(f"Excluding columns from normalization: {exclude_cols}")
+
             # Compute unified schema by merging all dataset features
             unified_features = dict(dataframes[0].features)
             for i, df in enumerate(dataframes[1:], start=1):
                 current_features = dict(df.features)
-                unified_features = self._merge_features_recursive(unified_features, current_features)
+                unified_features = self._merge_features_recursive(unified_features, current_features, exclude_cols)
                 logger.info(f"Merged schema from dataset {i}: {self.data_files[i]}")
 
             unified_features = datasets.Features(unified_features)
@@ -495,7 +509,7 @@ class RLHFDataset(Dataset):
             # Normalize all datasets to unified schema (including first)
             for i, df in enumerate(dataframes):
                 logger.info(f"Normalizing dataset {i} to unified schema: {self.data_files[i]}")
-                dataframes[i] = self._normalize_to_unified_schema(df, unified_features)
+                dataframes[i] = self._normalize_to_unified_schema(df, unified_features, exclude_cols)
 
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
