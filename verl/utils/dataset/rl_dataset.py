@@ -189,6 +189,192 @@ class RLHFDataset(Dataset):
             # Default to None for unknown types
             return None
 
+    def _merge_features_recursive(self, f1: dict, f2: dict) -> dict:
+        """
+        Recursively merge two feature dicts to create a union schema.
+
+        Handles:
+        - Top-level fields
+        - Nested struct (dict) fields
+        - Sequence/List types with struct elements
+
+        Args:
+            f1: First feature dict
+            f2: Second feature dict (to merge into f1)
+
+        Returns:
+            Merged feature dict containing all fields from both
+        """
+        result = dict(f1)
+
+        for key, feat2 in f2.items():
+            if key not in result:
+                # New field - add it
+                result[key] = feat2
+            else:
+                feat1 = result[key]
+                # Both have this field - check if we need to merge nested structs
+                if isinstance(feat1, dict) and isinstance(feat2, dict):
+                    # Both are structs - merge recursively
+                    result[key] = self._merge_features_recursive(feat1, feat2)
+                elif hasattr(feat1, 'feature') and hasattr(feat2, 'feature'):
+                    # Both are Sequence/List types - check inner type
+                    inner1 = feat1.feature
+                    inner2 = feat2.feature
+                    if isinstance(inner1, dict) and isinstance(inner2, dict):
+                        # List of structs - merge inner struct
+                        merged_inner = self._merge_features_recursive(inner1, inner2)
+                        result[key] = datasets.Sequence(feature=merged_inner)
+                # For other cases (primitives, type mismatch), keep f1's type
+
+        return result
+
+    def _get_default_for_feature(self, feature) -> any:
+        """
+        Get default value for a feature, including nested structs.
+
+        For nested dicts, recursively builds default structure.
+
+        Args:
+            feature: datasets.Features type object (can be nested dict)
+
+        Returns:
+            Default value appropriate for the feature type
+        """
+        if isinstance(feature, dict):
+            # Nested struct - build default dict with all fields
+            return {k: self._get_default_for_feature(v) for k, v in feature.items()}
+        elif hasattr(feature, 'feature'):
+            # Sequence/List type - return empty list
+            return []
+        else:
+            # Primitive type - use existing method
+            return self._get_default_value(feature)
+
+    def _fill_nested_fields(self, data: any, target_features: dict) -> any:
+        """
+        Recursively fill missing fields in nested structs.
+
+        Args:
+            data: The data value (dict, list, or primitive)
+            target_features: Target schema to conform to
+
+        Returns:
+            Data with missing fields filled with defaults
+        """
+        if data is None:
+            # Null value - create full default structure
+            return self._get_default_for_feature(target_features)
+
+        if isinstance(target_features, dict):
+            # Target is a struct
+            if not isinstance(data, dict):
+                data = {}
+
+            result = dict(data)
+            for key, feat in target_features.items():
+                if key not in result or result[key] is None:
+                    # Missing field - add default
+                    result[key] = self._get_default_for_feature(feat)
+                elif isinstance(feat, dict):
+                    # Nested struct - recurse
+                    result[key] = self._fill_nested_fields(result[key], feat)
+                elif hasattr(feat, 'feature') and isinstance(feat.feature, dict):
+                    # List of structs - fill each item
+                    if isinstance(result[key], list):
+                        result[key] = [
+                            self._fill_nested_fields(item, feat.feature)
+                            for item in result[key]
+                        ]
+            return result
+
+        elif hasattr(target_features, 'feature') and isinstance(target_features.feature, dict):
+            # List of structs
+            if isinstance(data, list):
+                return [
+                    self._fill_nested_fields(item, target_features.feature)
+                    for item in data
+                ]
+            return []
+
+        # Primitive or other type - return as-is
+        return data
+
+    def _normalize_to_unified_schema(
+        self,
+        dataframe: datasets.Dataset,
+        unified_features: datasets.Features
+    ) -> datasets.Dataset:
+        """
+        Normalize dataset to match unified schema.
+
+        Uses map() to fill missing nested fields, then casts to target schema.
+
+        Args:
+            dataframe: Dataset to normalize
+            unified_features: Unified schema (union of all datasets)
+
+        Returns:
+            Normalized dataset with schema matching unified_features
+        """
+        import logging
+        local_logger = logging.getLogger(__name__)
+
+        current_features = dataframe.features
+        needs_filling = False
+
+        # Check if any nested struct filling is needed
+        for col, feat in unified_features.items():
+            if col not in current_features:
+                needs_filling = True
+                break
+            if isinstance(feat, dict):
+                # Check nested struct differences
+                current_feat = current_features.get(col)
+                if current_feat != feat:
+                    needs_filling = True
+                    break
+            elif hasattr(feat, 'feature') and isinstance(feat.feature, dict):
+                current_feat = current_features.get(col)
+                if hasattr(current_feat, 'feature') and current_feat.feature != feat.feature:
+                    needs_filling = True
+                    break
+
+        if needs_filling:
+            # Use closure to capture unified_features and self
+            fill_nested = self._fill_nested_fields
+            get_default = self._get_default_for_feature
+
+            def normalize_example(example):
+                for col, feat in unified_features.items():
+                    if col.startswith('_'):
+                        # Skip internal columns like _file_index, _source_file
+                        continue
+                    if col not in example or example[col] is None:
+                        example[col] = get_default(feat)
+                    elif isinstance(feat, dict) or (hasattr(feat, 'feature') and isinstance(feat.feature, dict)):
+                        example[col] = fill_nested(example[col], feat)
+                return example
+
+            local_logger.info("Filling missing nested fields via map()")
+            dataframe = dataframe.map(normalize_example)
+
+        # Cast to ensure exact schema match
+        try:
+            dataframe = dataframe.cast(unified_features)
+            local_logger.info("Schema normalization successful")
+        except Exception as e:
+            error_msg = (
+                f"Schema normalization failed during casting.\n"
+                f"Unified schema: {unified_features}\n"
+                f"Current schema: {current_features}\n"
+                f"Error: {str(e)}\n"
+            )
+            local_logger.error(error_msg)
+            raise ValueError(error_msg) from e
+
+        return dataframe
+
     def _normalize_schema(self, dataframe: datasets.Dataset, reference_features: datasets.Features) -> datasets.Dataset:
         """
         Normalize dataset schema to match reference schema.
@@ -272,9 +458,9 @@ class RLHFDataset(Dataset):
         logger = logging.getLogger(__name__)
 
         dataframes = []
-        reference_features = None
         normalize = self.config.get('normalize_schema', False)
 
+        # Step 1: Load all parquet files
         for i, parquet_file in enumerate(self.data_files):
             # read parquet files and cache
             dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
@@ -284,20 +470,26 @@ class RLHFDataset(Dataset):
             dataframe = dataframe.add_column("_source_file", [parquet_file] * len(dataframe))
 
             logger.info(f"Loaded file {i}: {parquet_file} ({len(dataframe)} samples)")
-
-            # Establish reference schema from first dataset
-            if i == 0:
-                reference_features = dataframe.features
-                if normalize and len(self.data_files) > 1:
-                    logger.info(f"Schema normalization enabled. Using schema from first dataset as reference:")
-                    logger.info(f"Reference file: {parquet_file}")
-                    logger.info(f"Reference schema: {reference_features}")
-            # Normalize subsequent datasets if enabled
-            elif normalize:
-                logger.info(f"Normalizing schema for: {parquet_file}")
-                dataframe = self._normalize_schema(dataframe, reference_features)
-
             dataframes.append(dataframe)
+
+        # Step 2: Schema normalization using union schema
+        if normalize and len(self.data_files) > 1:
+            logger.info("Schema normalization enabled. Computing union schema from all datasets...")
+
+            # Compute unified schema by merging all dataset features
+            unified_features = dict(dataframes[0].features)
+            for i, df in enumerate(dataframes[1:], start=1):
+                current_features = dict(df.features)
+                unified_features = self._merge_features_recursive(unified_features, current_features)
+                logger.info(f"Merged schema from dataset {i}: {self.data_files[i]}")
+
+            unified_features = datasets.Features(unified_features)
+            logger.info(f"Unified schema: {unified_features}")
+
+            # Normalize all datasets to unified schema (including first)
+            for i, df in enumerate(dataframes):
+                logger.info(f"Normalizing dataset {i} to unified schema: {self.data_files[i]}")
+                dataframes[i] = self._normalize_to_unified_schema(df, unified_features)
 
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 

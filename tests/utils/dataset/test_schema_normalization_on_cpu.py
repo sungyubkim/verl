@@ -391,3 +391,153 @@ def test_get_default_value_method(tmp_path):
     assert dataset._get_default_value(Value('int64')) == 999
     assert dataset._get_default_value(Value('float')) == 3.14
     assert dataset._get_default_value(Value('bool')) == True
+
+
+def test_nested_struct_extra_subfield_in_later_dataset(tmp_path):
+    """Test that extra sub-columns in later dataset's nested struct are handled."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    file1 = tmp_path / "dataset1.parquet"
+    file2 = tmp_path / "dataset2.parquet"
+
+    # Dataset 1: extra_info has only 'a'
+    table1 = pa.table({
+        'prompt': ['Q1'],
+        'extra_info': [{'a': 1}]
+    })
+    pq.write_table(table1, file1)
+
+    # Dataset 2: extra_info has 'a' and 'b' (extra sub-column)
+    table2 = pa.table({
+        'prompt': ['Q2'],
+        'extra_info': [{'a': 2, 'b': 'extra_value'}]
+    })
+    pq.write_table(table2, file2)
+
+    config = OmegaConf.create({
+        'max_prompt_length': 512,
+        'max_response_length': 512,
+        'prompt_key': 'prompt',
+        'normalize_schema': True,
+        'schema_default_values': {
+            'str': '',
+            'int': 0,
+        }
+    })
+
+    tokenizer = MockTokenizer()
+
+    dataset = RLHFDataset(
+        data_files=[str(file1), str(file2)],
+        tokenizer=tokenizer,
+        config=config,
+    )
+
+    assert len(dataset.dataframe) == 2
+
+    # Both rows should have 'b' field in extra_info
+    assert 'b' in dataset.dataframe[0]['extra_info']
+    assert 'b' in dataset.dataframe[1]['extra_info']
+
+    # Dataset 1's row should have default value for 'b'
+    assert dataset.dataframe[0]['extra_info']['b'] == ''
+    # Dataset 2's row should have original value
+    assert dataset.dataframe[1]['extra_info']['b'] == 'extra_value'
+
+
+def test_deeply_nested_struct(tmp_path):
+    """Test schema normalization with deeply nested structs (3+ levels)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    file1 = tmp_path / "dataset1.parquet"
+    file2 = tmp_path / "dataset2.parquet"
+
+    # Dataset 1: nested struct with only 'x'
+    table1 = pa.table({
+        'prompt': ['Q1'],
+        'metadata': [{'level1': {'level2': {'x': 1}}}]
+    })
+    pq.write_table(table1, file1)
+
+    # Dataset 2: nested struct with 'x' and 'y'
+    table2 = pa.table({
+        'prompt': ['Q2'],
+        'metadata': [{'level1': {'level2': {'x': 2, 'y': 'deep_value'}}}]
+    })
+    pq.write_table(table2, file2)
+
+    config = OmegaConf.create({
+        'max_prompt_length': 512,
+        'max_response_length': 512,
+        'prompt_key': 'prompt',
+        'normalize_schema': True,
+        'schema_default_values': {
+            'str': '',
+            'int': 0,
+        }
+    })
+
+    tokenizer = MockTokenizer()
+
+    dataset = RLHFDataset(
+        data_files=[str(file1), str(file2)],
+        tokenizer=tokenizer,
+        config=config,
+    )
+
+    assert len(dataset.dataframe) == 2
+
+    # Check deeply nested field exists in both rows
+    assert 'y' in dataset.dataframe[0]['metadata']['level1']['level2']
+    assert dataset.dataframe[0]['metadata']['level1']['level2']['y'] == ''
+    assert dataset.dataframe[1]['metadata']['level1']['level2']['y'] == 'deep_value'
+
+
+def test_nested_struct_reverse_order(tmp_path):
+    """Test that order of datasets doesn't matter with union schema."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    file1 = tmp_path / "dataset1.parquet"
+    file2 = tmp_path / "dataset2.parquet"
+
+    # Dataset 1: extra_info has 'a' and 'b'
+    table1 = pa.table({
+        'prompt': ['Q1'],
+        'extra_info': [{'a': 1, 'b': 'value_b'}]
+    })
+    pq.write_table(table1, file1)
+
+    # Dataset 2: extra_info has only 'a' (missing 'b')
+    table2 = pa.table({
+        'prompt': ['Q2'],
+        'extra_info': [{'a': 2}]
+    })
+    pq.write_table(table2, file2)
+
+    config = OmegaConf.create({
+        'max_prompt_length': 512,
+        'max_response_length': 512,
+        'prompt_key': 'prompt',
+        'normalize_schema': True,
+        'schema_default_values': {
+            'str': '',
+        }
+    })
+
+    tokenizer = MockTokenizer()
+
+    dataset = RLHFDataset(
+        data_files=[str(file1), str(file2)],
+        tokenizer=tokenizer,
+        config=config,
+    )
+
+    assert len(dataset.dataframe) == 2
+
+    # Dataset 1's row should have original value
+    assert dataset.dataframe[0]['extra_info']['b'] == 'value_b'
+    # Dataset 2's row should have default value (this was previously failing)
+    assert dataset.dataframe[1]['extra_info']['b'] == ''
