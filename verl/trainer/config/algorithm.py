@@ -49,11 +49,14 @@ class FilterGroupsConfig(BaseConfig):
         enable (bool): Whether to enable filter groups.
         metric (Optional[str]): Metric to use for filtering: "acc", "score", "seq_reward", "seq_final_reward", etc.
         max_num_gen_batches (int): Non-positive values mean no upper limit.
+        log_unfiltered_metrics (bool): Whether to log metrics for unfiltered batch alongside filtered batch.
+            Useful for fair comparison with algorithms that don't filter (e.g., GRPO).
     """
 
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+    log_unfiltered_metrics: bool = True
 
 
 @dataclass

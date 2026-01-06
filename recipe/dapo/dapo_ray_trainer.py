@@ -173,6 +173,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         timing_raw = defaultdict(float)
         batch = None
+        unfiltered_batch = None  # For logging unfiltered metrics (GRPO comparison)
         num_prompt_in_batch = 0
         num_gen_batches = 0
         for epoch in range(self.config.trainer.total_epochs):
@@ -274,6 +275,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                         batch = new_batch
                     else:  # NOTE: When prompts after filtering is less than train batch size,
                         # we skip to the next generation batch
+
+                        # Accumulate unfiltered batch for metrics comparison (before filtering)
+                        if self.config.algorithm.filter_groups.log_unfiltered_metrics:
+                            unfiltered_batch = (
+                                new_batch if unfiltered_batch is None else DataProto.concat([unfiltered_batch, new_batch])
+                            )
+
                         metric_name = self.config.algorithm.filter_groups.metric
                         if metric_name == "seq_final_reward":
                             # Turn to numpy for easier filtering
@@ -330,6 +338,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                             # Align the batch
                             traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                             batch = batch[:traj_bsz]
+                            # Align unfiltered batch to same size for fair comparison
+                            if self.config.algorithm.filter_groups.log_unfiltered_metrics and unfiltered_batch is not None:
+                                unfiltered_batch = unfiltered_batch[:traj_bsz]
 
                     # === Updating ===
                     # Balance the number of valid tokens across DP ranks.
@@ -427,6 +438,31 @@ class RayDAPOTrainer(RayPPOTrainer):
                     curr_step_profile = next_step_profile
 
                 # collect metrics
+                # Compute unfiltered batch metrics for fair DAPO vs GRPO comparison
+                if (
+                    self.config.algorithm.filter_groups.enable
+                    and self.config.algorithm.filter_groups.log_unfiltered_metrics
+                    and unfiltered_batch is not None
+                ):
+                    unfiltered_acc_values = unfiltered_batch.non_tensor_batch.get("acc", None)
+                    unfiltered_metrics = compute_data_metrics(
+                        batch=unfiltered_batch,
+                        use_critic=False,  # Critic values not computed for unfiltered batch
+                        uids=unfiltered_batch.non_tensor_batch.get("uid"),
+                        n_samples_per_prompt=self.config.actor_rollout_ref.rollout.n,
+                        acc_values=unfiltered_acc_values,
+                    )
+                    # Add with "unfiltered/" prefix for distinction
+                    metrics.update({f"unfiltered/{k}": v for k, v in unfiltered_metrics.items()})
+
+                    # Log filter statistics
+                    metrics["filter/kept_ratio"] = len(batch.batch["responses"]) / len(
+                        unfiltered_batch.batch["responses"]
+                    )
+                    metrics["filter/removed_samples"] = len(unfiltered_batch.batch["responses"]) - len(
+                        batch.batch["responses"]
+                    )
+
                 # Extract acc values for pass@k computation (from reward_extra_info)
                 acc_values = batch.non_tensor_batch.get("acc", None)
                 metrics.update(
@@ -446,6 +482,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 metrics["train/num_gen_batches"] = num_gen_batches
                 batch = None
+                unfiltered_batch = None  # Reset unfiltered batch accumulator
                 num_prompt_in_batch = 0
                 num_gen_batches = 0
 
