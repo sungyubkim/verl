@@ -14,6 +14,8 @@
 
 import inspect
 
+import torch.distributed as dist
+
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
@@ -114,8 +116,9 @@ class NaiveRewardManager(RewardManagerBase):
 
         reward = score
 
-        # Debug logging
-        if self.num_examine > 0:
+        # Debug logging (only on rank 0 to avoid duplicate logs in distributed training)
+        is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+        if self.num_examine > 0 and is_main_process:
             if data_source not in self.already_print_data_sources:
                 self.already_print_data_sources[data_source] = 0
             if self.already_print_data_sources[data_source] < self.num_examine:
