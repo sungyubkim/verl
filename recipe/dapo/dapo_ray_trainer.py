@@ -62,6 +62,50 @@ class RayDAPOTrainer(RayPPOTrainer):
             old_log_prob.batch.pop("entropys")
             batch = batch.union(old_log_prob)
 
+            # Sanitize old_log_probs: NaN 토큰을 response_mask에서 제외
+            old_log_probs = batch.batch["old_log_probs"]
+            nan_mask_old = torch.isnan(old_log_probs)
+
+            if nan_mask_old.any():
+                nan_count = nan_mask_old.sum().item()
+                print(f"[NaN SANITIZE] old_log_probs has {nan_count} NaN values, masking out")
+
+                # NaN → 0으로 대체 (safe_exp(0)=1, 중립값)
+                old_log_probs = old_log_probs.clone()
+                old_log_probs[nan_mask_old] = 0.0
+                batch.batch["old_log_probs"] = old_log_probs
+
+                # response_mask에서 해당 토큰 제외
+                if "response_mask" in batch.batch:
+                    response_mask = batch.batch["response_mask"].clone()
+                    response_mask[nan_mask_old] = 0.0
+                    batch.batch["response_mask"] = response_mask
+
+            if "rollout_log_probs" in batch.batch.keys():
+                # Sanitize rollout_log_probs: NaN 토큰을 response_mask에서 제외
+                rollout_log_probs = batch.batch["rollout_log_probs"]
+                nan_mask = torch.isnan(rollout_log_probs)
+
+                if nan_mask.any():
+                    nan_count = nan_mask.sum().item()
+                    print(f"[NaN SANITIZE] rollout_log_probs has {nan_count} NaN values, masking out")
+
+                    # NaN → 0으로 대체 (safe_exp(0)=1, 중립값)
+                    rollout_log_probs = rollout_log_probs.clone()
+                    rollout_log_probs[nan_mask] = 0.0
+                    batch.batch["rollout_log_probs"] = rollout_log_probs
+
+                    # response_mask에서 해당 토큰 제외
+                    if "response_mask" in batch.batch:
+                        response_mask = batch.batch["response_mask"].clone()
+                        response_mask[nan_mask] = 0.0
+                        batch.batch["response_mask"] = response_mask
+
+                # Debug metrics: rollout vs actor log probs 차이 추적
+                from verl.utils.debug.metrics import calculate_debug_metrics
+
+                metrics.update(calculate_debug_metrics(batch))
+
         if self.use_reference_policy:
             # compute reference log_prob
             with marked_timer("ref", timing_raw, "olive"):
@@ -327,6 +371,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
                         )
 
                     # update critic
@@ -382,7 +427,17 @@ class RayDAPOTrainer(RayPPOTrainer):
                     curr_step_profile = next_step_profile
 
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # Extract acc values for pass@k computation (from reward_extra_info)
+                acc_values = batch.non_tensor_batch.get("acc", None)
+                metrics.update(
+                    compute_data_metrics(
+                        batch=batch,
+                        use_critic=self.use_critic,
+                        uids=batch.non_tensor_batch.get("uid"),
+                        n_samples_per_prompt=self.config.actor_rollout_ref.rollout.n,
+                        acc_values=acc_values,
+                    )
+                )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
@@ -393,6 +448,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                 batch = None
                 num_prompt_in_batch = 0
                 num_gen_batches = 0
+
+                # training step/epoch metrics
+                metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    }
+                )
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
