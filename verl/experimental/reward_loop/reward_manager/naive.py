@@ -28,10 +28,10 @@ class NaiveRewardManager(RewardManagerBase):
         self,
         config,
         tokenizer,
-        num_examine: int = 0,
         compute_score=None,
         reward_router_address=None,
         reward_model_tokenizer=None,
+        num_examine: int = 0,
     ):
         super().__init__(config, tokenizer, num_examine)
         self.compute_score = compute_score or default_compute_score

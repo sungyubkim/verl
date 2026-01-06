@@ -342,12 +342,12 @@ class RateLimitedRewardManager(RewardManagerBase):
         self,
         config: DictConfig | None = None,
         tokenizer: AutoTokenizer | None = None,
-        num_examine: int = 0,
         compute_score=None,
         reward_router_address=None,
         reward_model_tokenizer=None,
         # Legacy (AbstractRewardManager) kwargs for compatibility. Not used.
         reward_fn_key: str | None = None,
+        num_examine: int = 0,
         **kwargs,
     ):
         # When called via the legacy AbstractRewardManager signature, `config` may be absent.
