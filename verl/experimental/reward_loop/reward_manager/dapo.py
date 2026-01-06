@@ -24,8 +24,16 @@ from verl.utils.reward_score import default_compute_score
 class DAPORewardManager(RewardManagerBase):
     """DAPO Reward Manager."""
 
-    def __init__(self, config, tokenizer, compute_score=None, reward_router_address=None, reward_model_tokenizer=None):
-        super().__init__(config, tokenizer)
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        num_examine: int = 0,
+        compute_score=None,
+        reward_router_address=None,
+        reward_model_tokenizer=None,
+    ):
+        super().__init__(config, tokenizer, num_examine)
         self.compute_score = compute_score or default_compute_score
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
 
@@ -47,6 +55,13 @@ class DAPORewardManager(RewardManagerBase):
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
+
+        # Decode prompt for logging
+        prompt_ids = data_item.batch["prompts"]
+        prompt_length = prompt_ids.shape[-1]
+        valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
+        valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
         response_ids = data_item.batch["responses"]
         response_length = response_ids.shape[-1]
         valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
@@ -56,8 +71,11 @@ class DAPORewardManager(RewardManagerBase):
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
 
+        prompt_str = await self.loop.run_in_executor(
+            None, lambda: self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
+        )
         response_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
         )
         extra_reward_kwargs = (
             {
@@ -110,5 +128,22 @@ class DAPORewardManager(RewardManagerBase):
             if self.overlong_buffer_cfg.log:
                 reward_extra_info["overlong_reward"] = overlong_reward
                 reward_extra_info["overlong"] = overlong_reward < 0
+
+        # Debug logging
+        if self.num_examine > 0:
+            if data_source not in self.already_print_data_sources:
+                self.already_print_data_sources[data_source] = 0
+            if self.already_print_data_sources[data_source] < self.num_examine:
+                self.already_print_data_sources[data_source] += 1
+                print("[data_source]", data_source)
+                print("[prompt]", prompt_str)
+                print("[response]", response_str)
+                print("[ground_truth]", ground_truth)
+                if isinstance(result, dict):
+                    for key, value in result.items():
+                        print(f"[{key}]", value)
+                else:
+                    print("[score]", score)
+                print("[reward]", reward)
 
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}

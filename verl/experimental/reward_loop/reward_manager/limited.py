@@ -342,11 +342,11 @@ class RateLimitedRewardManager(RewardManagerBase):
         self,
         config: DictConfig | None = None,
         tokenizer: AutoTokenizer | None = None,
+        num_examine: int = 0,
         compute_score=None,
         reward_router_address=None,
         reward_model_tokenizer=None,
         # Legacy (AbstractRewardManager) kwargs for compatibility. Not used.
-        num_examine: int | None = None,
         reward_fn_key: str | None = None,
         **kwargs,
     ):
@@ -357,7 +357,7 @@ class RateLimitedRewardManager(RewardManagerBase):
         if tokenizer is None:
             raise TypeError("RateLimitedRewardManager requires `tokenizer`.")
 
-        super().__init__(config, tokenizer)
+        super().__init__(config, tokenizer, num_examine)
         self.compute_score = compute_score or default_compute_score
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
         self.reward_router_address = reward_router_address
@@ -399,6 +399,12 @@ class RateLimitedRewardManager(RewardManagerBase):
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
 
+        # Decode prompt for logging
+        prompt_ids = data_item.batch["prompts"]
+        prompt_length = prompt_ids.shape[-1]
+        valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
+        valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
         response_ids = data_item.batch["responses"]
         response_length = response_ids.shape[-1]
         valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
@@ -411,8 +417,11 @@ class RateLimitedRewardManager(RewardManagerBase):
         if tool_extra_fields is not None:
             extra_info.update(tool_extra_fields.items())
 
+        prompt_str = await self.loop.run_in_executor(
+            None, lambda: self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
+        )
         response_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
         )
 
         reward_extra_info = {}
@@ -465,6 +474,20 @@ class RateLimitedRewardManager(RewardManagerBase):
                 reward = 0.0
                 reward_extra_info["error"] = str(e)
                 reward_extra_info["acc"] = 0.0
+
+        # Debug logging
+        if self.num_examine > 0:
+            if data_source not in self.already_print_data_sources:
+                self.already_print_data_sources[data_source] = 0
+            if self.already_print_data_sources[data_source] < self.num_examine:
+                self.already_print_data_sources[data_source] += 1
+                print("[data_source]", data_source)
+                print("[prompt]", prompt_str)
+                print("[response]", response_str)
+                print("[ground_truth]", ground_truth)
+                print("[reward]", reward)
+                for key, value in reward_extra_info.items():
+                    print(f"[{key}]", value)
 
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}
 

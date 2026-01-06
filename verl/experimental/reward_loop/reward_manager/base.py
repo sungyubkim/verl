@@ -29,16 +29,19 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 class RewardManagerBase(ABC):
     _class_initialized = False
 
-    def __init__(self, config: DictConfig, tokenizer: AutoTokenizer):
+    def __init__(self, config: DictConfig, tokenizer: AutoTokenizer, num_examine: int = 0):
         """Initialize reward manager.
 
         Args:
             config (DictConfig): YAML config.
             tokenizer (AutoTokenizer): Tokenizer for tokenize messages.
+            num_examine (int): Number of samples to print per data source for debugging.
         """
         self.config = config
         self.tokenizer = tokenizer
         self.loop = get_event_loop()
+        self.num_examine = num_examine
+        self.already_print_data_sources = {}
         self.init_class(config, tokenizer)
 
     @classmethod
