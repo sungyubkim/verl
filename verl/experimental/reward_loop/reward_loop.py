@@ -265,8 +265,6 @@ class RewardLoopManager:
             node_id = node_ids[i % len(node_ids)]
             self.reward_loop_workers.append(
                 RewardLoopWorker.options(
-                    name=f"reward_loop_worker_{i}",
-                    get_if_exists=True,  # Reuse existing actor to avoid duplicate logging
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
                         soft=True,
