@@ -51,6 +51,10 @@ class RewardManagerBase(ABC):
             return
         cls._class_initialized = True
 
+    def reset_print_counters(self):
+        """Reset print counters for new batch/step."""
+        self.already_print_data_sources = {}
+
     @abstractmethod
     async def run_single(self, data: DataProto):
         raise NotImplementedError

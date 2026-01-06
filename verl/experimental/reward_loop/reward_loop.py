@@ -112,6 +112,9 @@ class RewardLoopWorker:
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
+        # Reset print counters at the start of each batch for per-step logging
+        self.reward_loop.reset_print_counters()
+
         tasks = []
         for i in range(len(data)):
             tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
