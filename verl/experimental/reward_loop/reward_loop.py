@@ -100,7 +100,8 @@ class RewardLoopWorker:
             raise ValueError(f"Unknown reward_loop_source: {reward_loop_source}. Must be 'register' or 'importlib'")
 
         # Only enable num_examine logging on worker 0 to avoid duplicate logs
-        num_examine = self.config.reward_model.get("num_examine", 0) if self.worker_index == 0 else 0
+        # Default to 1 (not 0) since num_examine is typically not set in config files
+        num_examine = self.config.reward_model.get("num_examine", 1) if self.worker_index == 0 else 0
         self.reward_loop = reward_manager_cls(
             self.config,
             self.input_tokenizer,
