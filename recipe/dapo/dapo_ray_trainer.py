@@ -277,7 +277,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                         # we skip to the next generation batch
 
                         # Accumulate unfiltered batch for metrics comparison (before filtering)
-                        if self.config.algorithm.filter_groups.log_unfiltered_metrics:
+                        if self.config.algorithm.filter_groups.get("log_unfiltered_metrics", True):
                             unfiltered_batch = (
                                 new_batch if unfiltered_batch is None else DataProto.concat([unfiltered_batch, new_batch])
                             )
@@ -339,7 +339,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                             batch = batch[:traj_bsz]
                             # Align unfiltered batch to same size for fair comparison
-                            if self.config.algorithm.filter_groups.log_unfiltered_metrics and unfiltered_batch is not None:
+                            if self.config.algorithm.filter_groups.get("log_unfiltered_metrics", True) and unfiltered_batch is not None:
                                 unfiltered_batch = unfiltered_batch[:traj_bsz]
 
                     # === Updating ===
@@ -441,7 +441,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 # Compute unfiltered batch metrics for fair DAPO vs GRPO comparison
                 if (
                     self.config.algorithm.filter_groups.enable
-                    and self.config.algorithm.filter_groups.log_unfiltered_metrics
+                    and self.config.algorithm.filter_groups.get("log_unfiltered_metrics", True)
                     and unfiltered_batch is not None
                 ):
                     unfiltered_acc_values = unfiltered_batch.non_tensor_batch.get("acc", None)
