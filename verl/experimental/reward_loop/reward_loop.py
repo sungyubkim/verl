@@ -38,7 +38,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class RewardLoopWorker:
-    def __init__(self, config: DictConfig, reward_router_address: str = None, worker_index: int = 0):
+    def __init__(self, config: DictConfig, reward_router_address: str = None, num_examine: int = 0):
         """
         RewardLoopWork can tackle reward computation:
         (1) rule-based reward computation
@@ -56,11 +56,11 @@ class RewardLoopWorker:
         Args:
             config: DictConfig, the config for reward loop worker.
             reward_router_address: str, the address of reward router.
-            worker_index: int, the index of this worker (0 = main worker for logging).
+            num_examine: int, number of samples to print per data source for debugging.
         """
         self.config = config
         self.reward_router_address = reward_router_address
-        self.worker_index = worker_index
+        self.num_examine = num_examine
         self._init_reward_fn()
 
     def _init_reward_fn(self):
@@ -99,17 +99,18 @@ class RewardLoopWorker:
         else:
             raise ValueError(f"Unknown reward_loop_source: {reward_loop_source}. Must be 'register' or 'importlib'")
 
-        # Only enable num_examine logging on worker 0 to avoid duplicate logs
-        # Default to 1 (not 0) since num_examine is typically not set in config files
-        num_examine = self.config.reward_model.get("num_examine", 1) if self.worker_index == 0 else 0
         self.reward_loop = reward_manager_cls(
             self.config,
             self.input_tokenizer,
             self.reward_fn,
             self.reward_router_address,
             self.reward_model_tokenizer,
-            num_examine=num_examine,
+            num_examine=self.num_examine,
         )
+
+    def reset_print_counters(self):
+        """Reset print counters for new batch/step."""
+        self.reward_loop.reset_print_counters()
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
         # Reset print counters at the start of each batch for per-step logging
@@ -263,13 +264,15 @@ class RewardLoopManager:
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
+            # Only first worker logs debug output to avoid duplicate logs
+            num_examine = self.config.reward_model.get("num_examine", 1) if i == 0 else 0
             self.reward_loop_workers.append(
                 RewardLoopWorker.options(
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
                         soft=True,
                     ),
-                ).remote(self.config, self.reward_router_address, i)
+                ).remote(self.config, self.reward_router_address, num_examine)
             )
 
     # this func is used to replace the legacy fsdp/megatron RewardModelWorker.compute_rm_score

@@ -250,14 +250,18 @@ class AgentLoopWorkerBase:
         config: DictConfig,
         server_handles: list[ray.actor.ActorHandle],
         reward_router_address: str = None,
+        worker_index: int = 0,
     ):
         """Initialize agent loop manager.
 
         Args:
             config (DictConfig): YAML config.
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+            reward_router_address (str): reward router address.
+            worker_index (int): the index of this worker (0 = main worker for logging).
         """
         self.config = config
+        self.worker_index = worker_index
 
         # for recipe to change
         if not hasattr(self, "server_manager"):
@@ -285,12 +289,14 @@ class AgentLoopWorkerBase:
         use_reward_loop = True if self.config.reward_model.use_reward_loop else None
         self.use_reward_loop = use_reward_loop
         if use_reward_loop and not hasattr(self, "reward_loop_worker"):
+            # Only first worker logs debug output to avoid duplicate logs
+            num_examine = self.config.reward_model.get("num_examine", 1) if self.worker_index == 0 else 0
             self.reward_loop_worker = RewardLoopWorker.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
                 ),
-            ).remote(self.config, self.reward_router_address)
+            ).remote(self.config, self.reward_router_address, num_examine)
 
         trace_config = self.config.actor_rollout_ref.rollout.get("trace", {})
         RolloutTraceConfig.init(
@@ -323,6 +329,10 @@ class AgentLoopWorkerBase:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        # Reset print counters at the start of each batch for per-step logging
+        if self.use_reward_loop and hasattr(self, "reward_loop_worker"):
+            await self.reward_loop_worker.reset_print_counters.remote()
+
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -669,15 +679,20 @@ class AgentLoopWorker(AgentLoopWorkerBase):
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
 
     def __init__(
-        self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], reward_router_address: str = None
+        self,
+        config: DictConfig,
+        server_handles: list[ray.actor.ActorHandle],
+        reward_router_address: str = None,
+        worker_index: int = 0,
     ):
         """Initialize agent loop manager.
         Args:
             config (DictConfig): YAML config.
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
             reward_router_address (str): reward router address.
+            worker_index (int): the index of this worker (0 = main worker for logging).
         """
-        super().__init__(config, server_handles, reward_router_address)
+        super().__init__(config, server_handles, reward_router_address, worker_index)
 
 
 async def get_trajectory_info(step, index, validate):
@@ -791,7 +806,7 @@ class AgentLoopManager:
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
-                ).remote(self.config, self.server_handles, self.reward_router_address)
+                ).remote(self.config, self.server_handles, self.reward_router_address, i)
             )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:

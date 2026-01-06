@@ -79,10 +79,14 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
 @ray.remote
 class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
     def __init__(
-        self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], reward_router_address: str = None
+        self,
+        config: DictConfig,
+        server_handles: list[ray.actor.ActorHandle],
+        reward_router_address: str = None,
+        worker_index: int = 0,
     ):
         self.server_manager = FullyAsyncLLMServerManager(config, server_handles)
-        super().__init__(config, server_handles, reward_router_address)
+        super().__init__(config, server_handles, reward_router_address, worker_index)
         # A shared cancellation event for all agent loops running on this worker.
         self.cancellation_event = asyncio.Event()
 
