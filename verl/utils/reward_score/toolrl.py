@@ -287,7 +287,7 @@ def compute_score(
         dict: Reward scores with keys:
             - score: Total reward (sum of all components)
             - reward_fmt: Format reward (0 to 1)
-            - reward_correct: Correctness reward (-3 to 3, or -1 to 1 if CORRECTMAX1=1)
+            - acc: Binary accuracy (1 if perfect tool call, 0 otherwise)
             - reward_length: Length reward (0 to 1, if enabled)
             - reward_think: Binary indicator if thinking section present
 
@@ -371,7 +371,7 @@ def compute_score(
     return {
         "score": total_score,
         "reward_fmt": format_score,
-        "reward_correct": correctness_score,
+        "acc": 1.0 if correctness_score >= tool_max else 0.0,  # Binary: perfect tool call only
         "reward_length": length_score,
         "reward_think": think_indicator,
     }

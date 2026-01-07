@@ -214,6 +214,7 @@ def compute_score(
             "f1": 0.0,
             "precision": 0.0,
             "recall": 0.0,
+            "acc": 0.0,
         }
 
     # Parse model answer
@@ -229,6 +230,7 @@ def compute_score(
             "f1": 0.0,
             "precision": 0.0,
             "recall": 0.0,
+            "acc": 0.0,
         }
 
     format_score = 1.0
@@ -259,4 +261,5 @@ def compute_score(
         "f1": f1,
         "precision": precision,
         "recall": recall,
+        "acc": score,  # sub_em score for pass@k
     }

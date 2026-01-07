@@ -265,6 +265,6 @@ def compute_score(
         "error": error_msg,
         "reward_think": 0.0,
         "reward_fmt": 0.0,
-        "reward_correct": 0.0,
+        "acc": float(score),  # Test pass rate for pass@k
         "reward_length": 0.0,
     }

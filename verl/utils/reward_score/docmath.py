@@ -287,6 +287,7 @@ def compute_score(
             "score": 0.0,
             "accurate_score": 0.0,
             "format_score": 0.0,
+            "acc": 0.0,
         }
 
     # Parse model answer
@@ -297,6 +298,7 @@ def compute_score(
             "score": 0.0,
             "accurate_score": 0.0,
             "format_score": 0.0,
+            "acc": 0.0,
         }
 
     format_score = 1.0
@@ -332,4 +334,5 @@ def compute_score(
         "score": accurate_score,
         "accurate_score": accurate_score,
         "format_score": format_score,
+        "acc": accurate_score,  # Binary 0/1 for pass@k
     }

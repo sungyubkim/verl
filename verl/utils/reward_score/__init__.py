@@ -13,7 +13,7 @@ class NormalizedScore(TypedDict, total=False):
                Empty string instead of None for Parquet compatibility
         reward_think: Reward for thinking/reasoning content. 0.0 if not applicable/not computed.
         reward_fmt: Reward for format correctness. 0.0 if not applicable/not computed.
-        reward_correct: Reward for correctness (e.g., tool calls). 0.0 if not applicable/not computed.
+        acc: Accuracy score for pass@k computation. Binary (0/1) derived from score or correctness.
         reward_length: Reward for response length. 0.0 if not applicable/not computed.
 
     Note: All reward_* fields use 0.0 instead of None for Parquet compatibility.
@@ -23,7 +23,7 @@ class NormalizedScore(TypedDict, total=False):
     error: str
     reward_think: float
     reward_fmt: float
-    reward_correct: float
+    acc: float
     reward_length: float
 
 
@@ -70,7 +70,7 @@ def normalize_score(raw_result, error=None) -> NormalizedScore:
         error = error or f"Invalid scorer result type: {type(raw_result)}"
 
     # Define standard fields that will be extracted
-    standard_fields = {"score", "error", "reward_think", "reward_fmt", "reward_correct", "reward_length"}
+    standard_fields = {"score", "error", "reward_think", "reward_fmt", "acc", "reward_length"}
 
     # Check if there are extra fields (dataset-specific debugging info)
     extra_fields = {}
@@ -110,7 +110,7 @@ def normalize_score(raw_result, error=None) -> NormalizedScore:
         "error": error_value if error_value is not None else "",  # "" instead of None
         "reward_think": float(base.get("reward_think") or 0.0),  # 0.0 instead of None
         "reward_fmt": float(base.get("reward_fmt") or 0.0),      # 0.0 instead of None
-        "reward_correct": float(base.get("reward_correct") or 0.0),  # 0.0 instead of None
+        "acc": float(base.get("acc") or 0.0),  # 0.0 instead of None
         "reward_length": float(base.get("reward_length") or 0.0),    # 0.0 instead of None
     }
 

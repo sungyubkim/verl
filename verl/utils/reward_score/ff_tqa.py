@@ -156,6 +156,7 @@ def compute_score(
             "accurate_score": 0.0,
             "bleu_score": 0.0,
             "rouge_score": 0.0,
+            "acc": 0.0,
         }
 
     # Check format (optional - 0.0 or 1.0)
@@ -184,4 +185,5 @@ def compute_score(
         "accurate_score": accurate_score,
         "bleu_score": bleu_score,
         "rouge_score": rougel_score,
+        "acc": accurate_score,  # Average of BLEU/ROUGE for pass@k
     }

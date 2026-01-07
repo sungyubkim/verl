@@ -152,6 +152,7 @@ def compute_score(
             "accurate_score": 0.0,
             "bleu_score": 0.0,
             "rouge_score": 0.0,
+            "acc": 0.0,
         }
 
     # Normalize predicted answer
@@ -163,6 +164,7 @@ def compute_score(
             "accurate_score": 0.0,
             "bleu_score": 0.0,
             "rouge_score": 0.0,
+            "acc": 0.0,
         }
 
     # Normalize ground truth
@@ -197,4 +199,5 @@ def compute_score(
         "accurate_score": accurate_score,
         "bleu_score": 0.0,
         "rouge_score": 0.0,
+        "acc": accurate_score,  # Binary 0/1 for pass@k
     }

@@ -300,6 +300,7 @@ def compute_score(
                         "score": 0.0,
                         "reward_fmt": 0.0,
                         "reward_think": 0.0,
+                        "acc": 0.0,
                         "error": error_msg,
                         "error_category": "system_error",
                         "error_summary": "Invalid ground truth format (failed to decode as pickle or JSON)"
@@ -314,6 +315,7 @@ def compute_score(
                 "score": 0.0,
                 "reward_fmt": 0.0,
                 "reward_think": 0.0,
+                "acc": 0.0,
                 "error": error_msg,
                 "error_category": "system_error",
                 "error_summary": f"Ground truth must be bytes or str, got {type(ground_truth).__name__}"
@@ -349,6 +351,7 @@ def compute_score(
                 "score": 0.0,
                 "reward_fmt": 0.0,
                 "reward_think": 0.0,
+                "acc": 0.0,
                 "error": "Invalid format",
                 "error_category": "format_error",
                 "error_summary": "Response missing required <think>/<answer> tags or <|channel|> blocks"
@@ -362,6 +365,7 @@ def compute_score(
                 "score": 0.0,
                 "reward_fmt": 1.0,  # Format is correct, but no code
                 "reward_think": 1.0,
+                "acc": 0.0,
                 "error": "No Verilog code found",
                 "error_category": "extraction_error",
                 "error_summary": "No Verilog code blocks found in answer section"
@@ -533,6 +537,7 @@ def compute_score(
                     "score": 0.0,
                     "reward_fmt": 1.0,  # Format was valid (we extracted modules)
                     "reward_think": 1.0,  # Thinking was present
+                    "acc": 0.0,
                     "error": error_msg,
                     "error_category": "verification_error",
                     "error_summary": f"All {len(extracted_modules)} module(s) failed with system errors (compile/API failure)",
@@ -553,6 +558,7 @@ def compute_score(
             "score": final_score,
             "reward_fmt": 1.0,  # Format is correct if we got here
             "reward_think": 1.0,  # Thinking structure is present
+            "acc": final_score,  # Binary 0/1 for pass@k
             "num_modules_extracted": len(extracted_modules),
             "num_variants_tested": len(rewards),
             "num_variants_passed": sum(rewards),
@@ -572,6 +578,7 @@ def compute_score(
             "score": 0.0,
             "reward_fmt": 0.0,
             "reward_think": 0.0,
+            "acc": 0.0,
             "error": f"Exception: {str(e)}",
             "error_category": "system_error",
             "error_summary": f"Unexpected exception during scoring: {type(e).__name__}"

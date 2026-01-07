@@ -97,4 +97,5 @@ def compute_score(
         "score": reward_correct,
         "reward_think": reward_think,
         "reward_fmt": reward_fmt,
+        "acc": reward_correct,  # Binary 0/1 for pass@k
     }

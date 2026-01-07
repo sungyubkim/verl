@@ -207,6 +207,7 @@ def compute_score(
             "score": score,
             "reward_think": reward_think,
             "reward_fmt": reward_fmt,
+            "acc": score,
         }
 
     # Step 2: Extract answer from \\boxed{} format
@@ -225,6 +226,7 @@ def compute_score(
             "score": score,
             "reward_think": reward_think,
             "reward_fmt": reward_fmt,
+            "acc": score,
         }
 
     # Step 3: Compare answer with ground truth
@@ -251,4 +253,5 @@ def compute_score(
         "score": float(score),
         "reward_think": float(reward_think),
         "reward_fmt": float(reward_fmt),
+        "acc": float(score),  # Binary 0/1 for pass@k
     }

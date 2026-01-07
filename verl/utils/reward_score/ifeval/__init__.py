@@ -86,11 +86,11 @@ def compute_score(
     # Validate inputs
     if not model_output or not model_output.strip():
         logger.warning("Empty model output received")
-        return {"score": 0.0, "reward_fmt": 1.0, "reward_think": 1.0}
+        return {"score": 0.0, "reward_fmt": 1.0, "reward_think": 1.0, "acc": 0.0}
 
     if not ground_truth:
         logger.warning("Empty ground truth received")
-        return {"score": 0.0, "reward_fmt": 1.0, "reward_think": 1.0}
+        return {"score": 0.0, "reward_fmt": 1.0, "reward_think": 1.0, "acc": 0.0}
 
     # Parse ground truth
     try:
@@ -105,7 +105,7 @@ def compute_score(
     except Exception as e:
         logger.error(f"Failed to parse ground_truth: {e}")
         logger.error(f"Ground truth value: {ground_truth[:200]}...")
-        return {"score": 0.0, "reward_fmt": 1.0, "reward_think": 1.0}
+        return {"score": 0.0, "reward_fmt": 1.0, "reward_think": 1.0, "acc": 0.0}
 
     # Remove thinking section from model output (format-aware)
     answer = remove_thinking_section(model_output, format_type=format_type)
@@ -119,7 +119,7 @@ def compute_score(
 
     if len(answer) == 0:
         logger.warning("Empty answer after removing thinking section")
-        return {"score": 0.0, "reward_fmt": 1.0, "reward_think": 1.0}
+        return {"score": 0.0, "reward_fmt": 1.0, "reward_think": 1.0, "acc": 0.0}
 
     for instruction_key, args in zip(instruction_keys, args_list):
         # Handle None args
@@ -149,6 +149,7 @@ def compute_score(
         "score": float(score),
         "reward_fmt": 1.0,
         "reward_think": 1.0,
+        "acc": float(score),  # Score is constraint satisfaction rate for pass@k
     }
 
 
