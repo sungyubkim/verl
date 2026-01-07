@@ -1,4 +1,4 @@
-# Copyright 2025 Individual Contributor: Mert Unsal
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .math_reward import compute_score
+"""
+CodeV Eval Toolkit for Verilog equivalence checking.
+Adapted from CodeV-R1 project for use with Sandbox Fusion.
+"""
 
+from .eval_codev import extract_verilog
+from .verify import eda_tools
 
-def compute_score_batched(data_sources, solution_strs, ground_truths, extra_infos):
-    """
-    This is a demonstration of how the batched reward function should look like.
-    Typically, you want to use batched reward to speed up the process with parallelization
-    """
-    return [
-        compute_score(solution_str, ground_truth)
-        for solution_str, ground_truth in zip(solution_strs, ground_truths, strict=True)
-    ]
+__all__ = ['extract_verilog', 'eda_tools']
