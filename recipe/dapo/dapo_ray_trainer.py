@@ -259,6 +259,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                             new_batch.non_tensor_batch.update(
                                 {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
                             )
+                            # Track reward extra info keys (sorted for consistent ordering across batches)
+                            if "reward_extra_keys" not in new_batch.meta_info:
+                                new_batch.meta_info["reward_extra_keys"] = sorted(reward_extra_infos_dict.keys())
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -403,7 +406,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        # Extract reward extra infos from batch.non_tensor_batch using tracked keys
+                        reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
+                        reward_extra_infos_from_batch = {
+                            key: batch.non_tensor_batch[key].tolist()
+                            for key in reward_extra_keys
+                            if key in batch.non_tensor_batch
+                        }
+                        self._log_rollout_data(batch, reward_extra_infos_from_batch, timing_raw, rollout_data_dir)
 
                 # validate
                 if (
