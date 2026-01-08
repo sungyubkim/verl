@@ -149,6 +149,8 @@ def verify_verilog_via_sandbox(
         dict: Verification result with 'correct' boolean and optional error info
     """
     try:
+        full_verilog = ""  # Initialize for exception handling (ensures return value exists)
+
         # Initialize EDA tools
         v = eda_tools(
             golden_suffix="_gold",
@@ -194,11 +196,11 @@ def verify_verilog_via_sandbox(
             # Only log ERROR for non-timeout issues (timeouts are expected)
             if "timeout" not in error_msg.lower():
                 logger.error(f"Sandbox API error: {error_msg}")
-            return {"correct": False, "api_error": error_msg}
+            return {"correct": False, "api_error": error_msg, "full_verilog": full_verilog}
 
         if not api_response:
             logger.error("No API response received")
-            return {"correct": False, "api_error": "No response from Sandbox"}
+            return {"correct": False, "api_error": "No response from Sandbox", "full_verilog": full_verilog}
 
         # Check response status
         api_status = api_response.get("status")
@@ -211,7 +213,8 @@ def verify_verilog_via_sandbox(
                 "correct": False,
                 "api_status": api_status,
                 "compile_stderr": compile_result.get("stderr") if compile_result else None,
-                "run_stderr": run_result.get("stderr") if run_result else None
+                "run_stderr": run_result.get("stderr") if run_result else None,
+                "full_verilog": full_verilog
             }
             return error_info
 
@@ -232,7 +235,8 @@ def verify_verilog_via_sandbox(
                 "correct": True,
                 "error_rate": error_rate,
                 "stdout": stdout,  # Full output
-                "stderr": stderr if stderr else None
+                "stderr": stderr if stderr else None,
+                "full_verilog": full_verilog
             }
         else:
             logger.debug(f"Functional mismatch: {error_rate*100:.1f}% of test cases failed (code compiled and ran successfully)")
@@ -240,12 +244,13 @@ def verify_verilog_via_sandbox(
                 "correct": False,
                 "error_rate": error_rate,
                 "stdout": stdout,  # Full output
-                "stderr": stderr if stderr else None
+                "stderr": stderr if stderr else None,
+                "full_verilog": full_verilog
             }
 
     except Exception as e:
         logger.error(f"Exception during Verilog verification: {e}", exc_info=True)
-        return {"correct": False, "exception": str(e)}
+        return {"correct": False, "exception": str(e), "full_verilog": full_verilog}
 
 
 def compute_score(
@@ -471,7 +476,7 @@ def compute_score(
                 "variant": variant_key,
                 "passed": variant_passed,
                 "num_modules_tested": len(module_results),
-                "module_results": module_results[:3]  # Keep first 3 for debugging
+                "module_results": module_results  # All attempts (user requested full logging)
             })
 
             rewards.append(1.0 if variant_passed else 0.0)
@@ -544,7 +549,7 @@ def compute_score(
                     "num_modules_extracted": len(extracted_modules),
                     "num_variants_tested": len(rewards),
                     "num_variants_passed": 0,
-                    "verification_results": verification_results[:3]
+                    "verification_results": verification_results  # All variants (user requested full logging)
                 }
 
         # Progress tracking: End
@@ -562,7 +567,7 @@ def compute_score(
             "num_modules_extracted": len(extracted_modules),
             "num_variants_tested": len(rewards),
             "num_variants_passed": sum(rewards),
-            "verification_results": verification_results[:3]  # Include first 3 for debugging
+            "verification_results": verification_results  # All variants (user requested full logging)
         }
 
         # Add error categorization if all modules failed
