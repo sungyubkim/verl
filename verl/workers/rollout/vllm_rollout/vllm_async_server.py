@@ -55,6 +55,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 _VLLM_VERSION = version.parse(vllm.__version__)
 
+
 if _VLLM_VERSION > version.parse("0.11.0"):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -108,6 +109,14 @@ class vLLMHttpServer:
             cuda_visible_devices (str): cuda visible devices.
         """
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
+        os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
+        # Forward the Ray job id into the vLLM worker subprocess so the
+        # colocated weight-transfer IPC socket path is unique per Ray job.
+        # Without this, two concurrent verl jobs on the same node both bind
+        # the same /tmp/rl-colocate-zmq-replica-0-rank-0.sock and one fails
+        # with EADDRINUSE; a stale socket from a crashed run trips the same
+        # error on restart.
+        os.environ["VERL_RAY_JOB_ID"] = ray.get_runtime_context().get_job_id()
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
@@ -282,7 +291,6 @@ class vLLMHttpServer:
                     served_model_name = served_model_name.split("/")[-1]
                 args["served_model_name"] = served_model_name
 
-        # mtp (None for diffusion models; only LLM models use speculative decoding)
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
             speculative_config = {
                 "method": self.config.mtp.method,
@@ -443,6 +451,8 @@ class vLLMHttpServer:
         request_id: str,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
@@ -486,8 +496,16 @@ class vLLMHttpServer:
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        if mm_processor_kwargs:
+            prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        try:
+            prompt = TokensPrompt(**prompt_kwargs)
+        except TypeError:
+            prompt = prompt_kwargs
 
         # Add lora request
         lora_request = None
@@ -512,6 +530,17 @@ class vLLMHttpServer:
         async for output in generator:
             final_res = output
         assert final_res is not None
+
+        # Handle abort case: when the request is aborted by pause_generation(abort),
+        # outputs may be empty. Return empty results with stop_reason="aborted"
+        # instead of crashing with "IndexError: list index out of range".
+        if not final_res.outputs:
+            return TokenOutput(
+                token_ids=[],
+                log_probs=None,
+                routed_experts=None,
+                stop_reason="aborted",
+            )
 
         extra_fields = {"global_steps": self.global_steps}
         extract_prompt_logprobs(
@@ -576,6 +605,22 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    async def clear_kv_cache(self):
+        if self.node_rank == 0:
+            await self.engine.reset_prefix_cache()
+
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact.
+        # TODO: support true release of kv_cache
+        """
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
+        if self.node_rank != 0:
+            return
+
     async def start_profile(self, **kwargs):
         if (
             self.profiler_controller.check_enable()
@@ -591,10 +636,6 @@ class vLLMHttpServer:
             and self.profiler_controller.is_discrete_mode()
         ):
             await self.engine.stop_profile()
-
-    async def clear_kv_cache(self):
-        if self.node_rank == 0:
-            await self.engine.reset_prefix_cache()
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
@@ -855,14 +896,14 @@ class vLLMHttpServer:
         """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""
         # Don't use engine.sleep(level=2) here
         # lora only update adapter weights, so set sleep level to 1
-        if self.lora_as_adapter:
+        # vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
+        if self.lora_as_adapter or is_torch_npu_available(check_device=False):
             sleep_level = 1
         else:
             sleep_level = 2
         await self.engine.collective_rpc("sleep", kwargs={"level": sleep_level})
-
-        # clear encoder cache: https://github.com/vllm-project/vllm/pull/33452
-        # await self.engine.reset_encoder_cache()
+        if _VLLM_VERSION >= version.parse("0.17.0"):
+            await self.engine.reset_encoder_cache()
 
 
 class vLLMReplica(RolloutReplica):
@@ -874,8 +915,11 @@ class vLLMReplica(RolloutReplica):
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
+        name_suffix: str = "",
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model)
+        super().__init__(
+            replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
+        )
         self.server_class = ray.remote(vLLMHttpServer)
 
     async def launch_servers(self):
@@ -911,11 +955,11 @@ class vLLMReplica(RolloutReplica):
             node_id = worker_node_ids[node_rank * gpus_per_replica_node]
             prefix = self._get_server_name_prefix()
             if self.is_reward_model:
-                name = f"{prefix}server_reward_{self.replica_rank}_{node_rank}"
+                name = f"{prefix}server_reward_{self.replica_rank}_{node_rank}{self.name_suffix}"
             elif self.is_teacher_model:
-                name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}"
+                name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}{self.name_suffix}"
             else:
-                name = f"{prefix}server_{self.replica_rank}_{node_rank}"
+                name = f"{prefix}server_{self.replica_rank}_{node_rank}{self.name_suffix}"
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
@@ -1014,6 +1058,12 @@ class vLLMReplica(RolloutReplica):
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
 
+    async def release_kv_cache(self):
+        # Drain all in-flight requests so that vLLM worker threads go idle
+        # before we touch engine.release_kv_cache()
+        await self.servers[0].wait_for_requests_to_drain.remote()
+        await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
+
     # -----------------------------------------------------------------------
     # Hook methods for subclass overrides
     # -----------------------------------------------------------------------
@@ -1028,5 +1078,5 @@ class vLLMReplica(RolloutReplica):
             )
 
     def _get_server_name_prefix(self) -> str:
-        """Return the Ray actor name prefix (e.g. 'vllm_' or 'vllm_omni_')."""
+        """Return the Ray actor name prefix (e.g. 'vllm_')."""
         return "vllm_"
