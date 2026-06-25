@@ -53,8 +53,10 @@ Last updated: 12/20/2025.
    -  module: 是否记录框架层Python调用栈信息。相较于stack，更推荐使用module记录调用栈信息，因其产生的性能膨胀更低。
    -  stack: 是否记录算子调用栈信息。
 
--  analysis: 启用自动数据解析。
--  discrete: 使用离散模式。
+-  analysis: 是否启用自动数据解析。
+-  discrete: 是否使用离散模式。
+-  profile_token_start：仅在 rollout role 下生效，用于指定 rollout 解码阶段的采集起始 response token；参数合法时生效（从 0 开始，满足 ``profile_token_end > profile_token_start``，且区间在 response 长度内）。
+-  profile_token_end：仅在 rollout role 下生效，用于指定 rollout 解码阶段的采集结束 response token（右边界不包含）；参数合法时生效（从 0 开始，满足 ``profile_token_end > profile_token_start``，且区间在 response 长度内）。
 
 示例
 ----
@@ -62,59 +64,51 @@ Last updated: 12/20/2025.
 禁用采集
 ~~~~~~~~~~~~~~~~~~~~
 
-.. code:: yaml
+.. code:: bash
 
-      global_profiler:
-         steps: null # disable profile
+            global_profiler.steps=null
 
 端到端采集
 ~~~~~~~~~~~~~~~~~~~~~
 
-.. code:: yaml
+.. code:: bash
 
-      global_profiler:
-         steps: [1, 2, 5]
-         save_path: ./outputs/profile
-      actor_rollout_ref:
-         actor:  # 设置 actor role 的 profiler 采集配置参数
-            profiler:
-               enable: True
-               all_ranks: True
-               tool_config:
-                  npu:
-                     discrete: False
-                     contents: [npu, cpu]  # 控制采集列表，默认cpu、npu，可配置memory、shapes、module等
-
+        global_profiler.tool=npu
+        global_profiler.steps="[1, 2, 5]" # 采集步数
+        global_profiler.save_path=./outputs/profile
+        actor_rollout_ref.actor.profiler.enable=True
+        actor_rollout_ref.actor.profiler.all_ranks=False
+        actor_rollout_ref.actor.profiler.ranks="[0]" # 只采集rank0
+        actor_rollout_ref.actor.profiler.tool_config.npu.discrete=True # 推荐使用离散模式，各阶段数据分开存储
+        actor_rollout_ref.actor.profiler.tool_config.npu.contents="['npu','cpu']" # 控制采集列表，默认cpu、npu，可配置memory、shapes、module等
+        actor_rollout_ref.actor.profiler.tool_config.npu.level=level1
+        actor_rollout_ref.actor.profiler.tool_config.npu.analysis=False # 禁用自动数据解析
         # rollout & ref follow actor settings
 
 
-离散模式采集
+训练和推理阶段分离
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. code:: yaml
+.. code:: bash
 
-      global_profiler:
-         steps: [1, 2, 5]
-         save_path: ./outputs/profile
-      actor_rollout_ref:
-         actor:
-            profiler:
-               enable: True  # 设置为 True 以采集训练阶段
-               all_ranks: False
-               ranks: [0]  # 全局 Rank 0
-               tool_config:
-                  npu:
-                     discrete: True
-                     contents: [npu, cpu]
-         rollout:
-            profiler:
-               enable: True  # 设置为 True 以采集推理阶段
-               all_ranks: False
-               ranks: [0]  # 在 Agent Loop 模式下，此处指推理实例的 Replica Rank (例如第 0 个实例)
-               tool_config:
-                  npu:
-                     discrete: True  # Agent Loop 模式下必须开启离散模式
-         # ref follow actor settings
+      global_profiler.tool=npu
+      global_profiler.steps="[1, 2, 5]" # 采集步数
+      global_profiler.save_path=./outputs/profile
+      actor_rollout_ref.actor.profiler.enable=True
+      actor_rollout_ref.actor.profiler.all_ranks=False
+      actor_rollout_ref.actor.profiler.ranks="[0]" # 只采集rank0
+      actor_rollout_ref.actor.profiler.tool_config.npu.discrete=True # 推荐使用离散模式，各阶段数据分开存储
+      actor_rollout_ref.actor.profiler.tool_config.npu.contents="['npu','cpu']" # 控制采集列表，默认cpu、npu，可配置memory、shapes、module等
+      actor_rollout_ref.actor.profiler.tool_config.npu.level=level1
+      actor_rollout_ref.actor.profiler.tool_config.npu.analysis=False # 禁用自动数据解析
+
+      actor_rollout_ref.rollout.profiler.enable=True
+      actor_rollout_ref.rollout.profiler.all_ranks=False
+      actor_rollout_ref.rollout.profiler.ranks="[0]" # 只采集rank0
+      # 可选：按 response token 区间采集；不设置 start/stop 时采集整个 rollout 阶段
+      actor_rollout_ref.rollout.profiler.tool_config.npu.profile_token_start=12
+      actor_rollout_ref.rollout.profiler.tool_config.npu.profile_token_end=46
+      # ref follow actor settings
 
 **Agent Loop 模式说明**：
 
@@ -127,12 +121,18 @@ Last updated: 12/20/2025.
    - vLLM 引擎：自动采集 AsyncLLM 调度栈及推理进程性能数据。不支持设置 analysis（默认不解析，需离线解析）和 profiler_level（默认 level1）。
    - SGLang 引擎：自动采集推理进程性能数据。不支持 contents 中的 memory 配置项。不支持设置 analysis（默认解析）和 profiler_level（默认 level0）。
 
+**Fully Async Policy 模式说明**：
+
+1. 在 `Fully Async Policy <https://verl.readthedocs.io/en/latest/advance/fully_async.html>`_ 模式下，`global_profiler.steps` 代表每一轮`update_weights`后的`step`, 这点和同步模式下保持同步，而非单轮的`mini-batch step`.
+
+2. 因为复用AgentLoop采集能力，因此在 `Fully Async Policy <https://verl.readthedocs.io/en/latest/advance/fully_async.html>`_ 模式下的注意事项和AgentLoop相同。
+
 可视化
 ------
 
 采集后的数据存放在用户设置的save_path下，可通过 `MindStudio Insight <https://www.hiascend.com/document/detail/zh/mindstudio/80RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0002.html>`_ 工具进行可视化。
 
-另外在Linux环境下，MindStudio Insight工具提供了 `JupyterLab插件 <https://www.hiascend.com/document/detail/zh/mindstudio/82RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0130.html>`_ 形态，提供更直观和交互式强的操作界面。JupyterLab插件优势如下：
+另外在Linux环境下，MindStudio Insight工具提供了 [JupyterLab插件](https://www.hiascend.com/document/detail/zh/mindstudio/82RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0130.html) 形态，提供更直观和交互式强的操作界面。JupyterLab插件优势如下：
 
 - 无缝集成：支持在Jupyter环境中直接运行MindStudio Insight工具，无需切换平台，无需拷贝服务器上的数据，实现数据即采即用。
 - 快速启动：通过JupyterLab的命令行或图形界面，可快速启动MindStudio Insight工具。

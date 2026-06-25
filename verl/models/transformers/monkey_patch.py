@@ -330,9 +330,11 @@ def apply_monkey_patch(
     try:
         num_attention_heads, num_key_value_heads = model.config.num_attention_heads, model.config.num_key_value_heads
     except AttributeError:
+        # Some multimodal configs nest text_config differently; fall back to get_text_config().
+        text_config = getattr(model.config, "text_config", None) or model.config.get_text_config()
         num_attention_heads, num_key_value_heads = (
-            model.config.text_config.num_attention_heads,
-            model.config.text_config.num_key_value_heads,
+            text_config.num_attention_heads,
+            text_config.num_key_value_heads,
         )
 
     assert num_attention_heads % ulysses_sp_size == 0, (
@@ -345,7 +347,10 @@ def apply_monkey_patch(
     )
 
     if is_trl_available():
-        from trl import AutoModelForCausalLMWithValueHead  # type: ignore
+        try:
+            from trl.experimental.ppo import AutoModelForCausalLMWithValueHead  # type: ignore
+        except ImportError:
+            from trl import AutoModelForCausalLMWithValueHead  # type: ignore
 
         def state_dict(self, *args, **kwargs):
             return torch.nn.Module.state_dict(self, *args, **kwargs)
@@ -494,11 +499,13 @@ def apply_monkey_patch(
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
             Qwen3_5ForConditionalGeneration,
             Qwen3_5Model,
+            Qwen3_5TextModel,
             Qwen3_5VisionModel,
         )
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
             Qwen3_5MoeForConditionalGeneration,
             Qwen3_5MoeModel,
+            Qwen3_5MoeTextModel,
             Qwen3_5MoeVisionModel,
         )
 
@@ -517,6 +524,9 @@ def apply_monkey_patch(
         # Step 2: patch vision model to fix fsdp2 cpu_offload bug.
         Qwen3_5VisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
         Qwen3_5MoeVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
+        if ulysses_sp_size > 1:
+            patch_vlm_for_ulysses_input_slicing(Qwen3_5TextModel)
+            patch_vlm_for_ulysses_input_slicing(Qwen3_5MoeTextModel)
 
     if use_remove_padding or ulysses_sp_size > 1:
         if hasattr(module, "_flash_attention_forward"):  # transformers <= 4.47.1 or legacy models

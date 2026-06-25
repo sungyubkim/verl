@@ -61,8 +61,10 @@ Use parameters in each role's ``profiler.tool_config.npu`` to control npu profil
    -  module: Whether to record framework-layer Python call stack information. It is recommended to use 'module' instead of 'stack' for recording call stack information, as it costs less performance overhead.
    -  stack: Whether to record operator call stack information.
 
--  analysis: Enables automatic data parsing.
+-  analysis: Whether to enable automatic data parsing.
 -  discrete: Whether to enable discrete mode.
+-  profile_token_start: Effective only for the rollout role; defines the start response-token index for rollout decoding collection. It is applied only when valid (0-based, ``profile_token_end > profile_token_start``, and the window is within response length).
+-  profile_token_end: Effective only for the rollout role; defines the stop response-token index (exclusive) for rollout decoding collection. It is applied only when valid (0-based, ``profile_token_end > profile_token_start``, and the window is within response length).
 
 
 Examples
@@ -71,58 +73,50 @@ Examples
 Disabling collection
 ~~~~~~~~~~~~~~~~~~~~
 
-.. code:: yaml
+.. code:: bash
 
-      global_profiler:
-         steps: null # disable profile
+            global_profiler.steps=null
 
 End-to-End collection
 ~~~~~~~~~~~~~~~~~~~~~
 
-.. code:: yaml
+.. code:: bash
 
-      global_profiler:
-         steps: [1, 2, 5]
-         save_path: ./outputs/profile
-      actor_rollout_ref:
-         actor:  # Set actor role profiler collection configuration parameters
-            profiler:
-               enable: True
-               all_ranks: True
-               tool_config:
-                  npu:
-                     discrete: False
-                     contents: [npu, cpu]  # Control collection list, default cpu, npu, can configure memory, shapes, module, etc.
+        global_profiler.tool=npu
+        global_profiler.steps="[1, 2, 5]" # Number of steps to be collected.
+        global_profiler.save_path=./outputs/profile
+        actor_rollout_ref.actor.profiler.enable=True
+        actor_rollout_ref.actor.profiler.all_ranks=False
+        actor_rollout_ref.actor.profiler.ranks="[0]" # Only collect rank 0 data.
+        actor_rollout_ref.actor.profiler.tool_config.npu.discrete=True # The discrete mode is recommended, in which data of each phase is stored separately.
+        actor_rollout_ref.actor.profiler.tool_config.npu.contents="['npu','cpu']" # Control collection list, default cpu, npu, can configure memory, shapes, module, etc.
+        actor_rollout_ref.actor.profiler.tool_config.npu.level=level1
+        actor_rollout_ref.actor.profiler.tool_config.npu.analysis=False # Disabling automatic data parsing
         # rollout & ref follow actor settings
 
-
-Discrete Mode Collection
+Separation of Training and Inference Collection
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. code:: yaml
+.. code:: bash
 
-      global_profiler:
-         steps: [1, 2, 5]
-         save_path: ./outputs/profile
-      actor_rollout_ref:
-         actor:
-            profiler:
-               enable: True  # Set to True to profile training
-               all_ranks: False
-               ranks: [0]  # Global Rank 0
-               tool_config:
-                  npu:
-                     discrete: True
-                     contents: [npu, cpu]
-         rollout:
-            profiler:
-               enable: True  # Set to True to profile inference
-               all_ranks: False
-               ranks: [0]  # In Agent Loop mode, this is the Replica Rank (e.g., 0-th instance)
-               tool_config:
-                  npu:
-                     discrete: True  # Must be enabled in Agent Loop mode
-         # ref follow actor settings
+      global_profiler.tool=npu
+      global_profiler.steps="[1, 2, 5]" # Number of steps to be collected.
+      global_profiler.save_path=./outputs/profile
+      actor_rollout_ref.actor.profiler.enable=True
+      actor_rollout_ref.actor.profiler.all_ranks=False
+      actor_rollout_ref.actor.profiler.ranks="[0]" # Only collect rank 0 data.
+      actor_rollout_ref.actor.profiler.tool_config.npu.discrete=True # The discrete mode is recommended, in which data of each phase is stored separately.
+      actor_rollout_ref.actor.profiler.tool_config.npu.contents="['npu','cpu']" # Control collection list, default cpu, npu, can configure memory, shapes, module, etc.
+      actor_rollout_ref.actor.profiler.tool_config.npu.level=level1
+      actor_rollout_ref.actor.profiler.tool_config.npu.analysis=False # Disabling automatic data parsing
+
+      actor_rollout_ref.rollout.profiler.enable=True
+      actor_rollout_ref.rollout.profiler.all_ranks=False
+      actor_rollout_ref.rollout.profiler.ranks="[0]" # Only collect rank 0 data.
+      # (Optional) Collect data by response token. If start and stop are not set, the entire rollout phase is collected.
+      actor_rollout_ref.rollout.profiler.tool_config.npu.profile_token_start=12
+      actor_rollout_ref.rollout.profiler.tool_config.npu.profile_token_end=46
+      # ref follow actor settings
 
 **Agent Loop Mode Description**:
 
@@ -135,6 +129,12 @@ When Rollout runs in `Agent Loop <../advance/agent_loop.rst>`_ mode, performance
    - vLLM Engine: Automatically collects AsyncLLM scheduling stacks and inference process performance data. Does not support setting analysis (defaults to no analysis, requires offline analysis) and profiler_level (defaults to level1).
    - SGLang Engine: Automatically collects inference process performance data. Does not support the memory option in contents. Does not support setting analysis (defaults to enabled) and profiler_level (defaults to level0).
 
+**Fully Async Policy Mode Description**:
+
+1. In `Fully Async Policy <https://verl.readthedocs.io/en/latest/advance/fully_async.html>`_ mode, ``global_profiler.steps`` refers to the step **after each** ``update_weights`` round. This is consistent with synchronous mode, not a per mini-batch step within a single training round.
+
+2. Because it reuses Agent Loop collection capabilities, the notes for `Fully Async Policy <https://verl.readthedocs.io/en/latest/advance/fully_async.html>`_ mode are the same as for Agent Loop.
+
 
 Visualization
 -------------
@@ -142,7 +142,7 @@ Visualization
 Collected data is stored in the user-defined save_path and can be
 visualized by using the `MindStudio Insight <https://www.hiascend.com/document/detail/zh/mindstudio/80RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0002.html>`_ tool.
 
-Additionally, in a Linux environment, the MindStudio Insight tool is provided in the form of a `JupyterLab Plugin <https://www.hiascend.com/document/detail/zh/mindstudio/82RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0130.html>`_ ，offering a more intuitive and highly interactive user interface. The advantages of the JupyterLab plugin are as follows:
+Additionally, in a Linux environment, the MindStudio Insight tool is provided in the form of a [JupyterLab Plugin](https://www.hiascend.com/document/detail/zh/mindstudio/82RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0130.html), offering a more intuitive and highly interactive user interface. The advantages of the JupyterLab plugin are as follows:
 
 - Seamless integration: Supports running the MindStudio Insight tool directly within the Jupyter environment, eliminating the need to switch platforms or copy data from the server, enabling data to be collected and used immediately.
 - Fast startup: Allows MindStudio Insight to be launched quickly via the JupyterLab command line or graphical interface.
